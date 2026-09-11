@@ -42,14 +42,37 @@ app.use(
   })
 );
 
+// ✅ CORS : localhost + toutes les URLs Netlify et Render
+const corsOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5173/',
+  'http://localhost:5000',
+  'https://micro-assurance-adi.netlify.app',
+  'https://micro-frontend.netlify.app',
+  'https://micro-assurance-frontend.vercel.app',
+];
+
+if (process.env.FRONTEND_URL) {
+  corsOrigins.push(process.env.FRONTEND_URL);
+}
+
 app.use(
   cors({
-    origin: [
-      'http://localhost:5173',
-      'http://localhost:5000',
-      'https://micro-frontend.netlify.app',
-      'https://micro-assurance-frontend.vercel.app',
-    ],
+    origin: (origin, callback) => {
+      // Autoriser les requêtes sans origin (Postman, curl, apps mobiles)
+      if (!origin) return callback(null, true);
+
+      // Whitelist explicite
+      if (corsOrigins.includes(origin)) return callback(null, true);
+
+      // ✅ Accepter tous les sous-domaines Netlify et Render
+      if (/\.netlify\.app$/.test(origin)) return callback(null, true);
+      if (/\.onrender\.com$/.test(origin)) return callback(null, true);
+
+      // Refuser les autres
+      console.warn(`⚠️ CORS refusé pour : ${origin}`);
+      return callback(new Error('Not allowed by CORS'));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -77,6 +100,7 @@ app.use('/api/jobs', jobRoutes);
 app.use('/api/statistiques', statistiqueRoutes);
 app.use('/api/preuves-paiement', preuvePaiementRoutes);
 app.use('/api/users', userRoutes);
+
 // ============================================================
 // 4. ROUTES DE SERVICE
 // ============================================================
@@ -121,6 +145,8 @@ app.get('/', (req, res) => {
       factures: '/api/factures',
       jobs: '/api/jobs',
       statistiques: '/api/statistiques',
+      preuvesPaiement: '/api/preuves-paiement',
+      users: '/api/users',
     },
   });
 });
@@ -173,18 +199,20 @@ app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur http://localhost:${PORT}`);
   console.log(`📊 Mode: ${process.env.NODE_ENV || 'development'}`);
   console.log('='.repeat(50));
-  console.log(`🔍 Health check:  http://localhost:${PORT}/api/health`);
-  console.log(`🔐 Auth:          http://localhost:${PORT}/api/auth`);
-  console.log(`📂 SFD:           http://localhost:${PORT}/api/sfd`);
-  console.log(`📄 Contrats:      http://localhost:${PORT}/api/contrats`);
-  console.log(`📋 Reporting:     http://localhost:${PORT}/api/reporting`);
-  console.log(`🚨 Sinistres:     http://localhost:${PORT}/api/sinistres`);
-  console.log(`🏢 Assureurs:     http://localhost:${PORT}/api/assureurs`);
-  console.log(`📊 Dashboard:     http://localhost:${PORT}/api/dashboard`);
-  console.log(`📈 CR:            http://localhost:${PORT}/api/cr`);
-  console.log(`📄 Factures:      http://localhost:${PORT}/api/factures`);
-  console.log(`📦 Jobs:          http://localhost:${PORT}/api/jobs`);
-  console.log(`📈 Stats:         http://localhost:${PORT}/api/statistiques`);
+  console.log(`🔍 Health check:    http://localhost:${PORT}/api/health`);
+  console.log(`🔐 Auth:            http://localhost:${PORT}/api/auth`);
+  console.log(`📂 SFD:             http://localhost:${PORT}/api/sfd`);
+  console.log(`📄 Contrats:        http://localhost:${PORT}/api/contrats`);
+  console.log(`📋 Reporting:       http://localhost:${PORT}/api/reporting`);
+  console.log(`🚨 Sinistres:       http://localhost:${PORT}/api/sinistres`);
+  console.log(`🏢 Assureurs:       http://localhost:${PORT}/api/assureurs`);
+  console.log(`📊 Dashboard:       http://localhost:${PORT}/api/dashboard`);
+  console.log(`📈 CR:              http://localhost:${PORT}/api/cr`);
+  console.log(`📄 Factures:        http://localhost:${PORT}/api/factures`);
+  console.log(`📦 Jobs:            http://localhost:${PORT}/api/jobs`);
+  console.log(`📈 Stats:           http://localhost:${PORT}/api/statistiques`);
+  console.log(`💰 Preuves:         http://localhost:${PORT}/api/preuves-paiement`);
+  console.log(`👥 Users:           http://localhost:${PORT}/api/users`);
   console.log('='.repeat(50));
 });
 
