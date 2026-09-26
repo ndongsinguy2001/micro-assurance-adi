@@ -25,8 +25,17 @@ const STATUT_REPORTING = {
   CLOTURE: 'CLOTURE',
 };
 
+const BATCH_SIZE = 500;
+const PREVIEW_LIMIT = 30;
+const MAX_ROWS = 100000;
+
+const MOIS_NOMS_UPPER = [
+  'JANVIER', 'FEVRIER', 'MARS', 'AVRIL', 'MAI', 'JUIN',
+  'JUILLET', 'AOUT', 'SEPTEMBRE', 'OCTOBRE', 'NOVEMBRE', 'DECEMBRE',
+];
+
 // ============================================================
-//  FONCTIONS UTILITAIRES
+//  UTILITAIRES
 // ============================================================
 
 const getOrCreateDefaultAssureur = async () => {
@@ -38,7 +47,6 @@ const getOrCreateDefaultAssureur = async () => {
       pays: 'Sénégal',
       statut: 'ACTIF',
     });
-    console.log('✅ Assureur par défaut créé');
   }
   return assureur;
 };
@@ -85,28 +93,30 @@ const calculerAge = (dateNaissance, dateReference) => {
   const reference = new Date(dateReference);
   let age = reference.getFullYear() - naissance.getFullYear();
   const m = reference.getMonth() - naissance.getMonth();
-  if (m < 0 || (m === 0 && reference.getDate() < naissance.getDate())) {
-    age--;
-  }
+  if (m < 0 || (m === 0 && reference.getDate() < naissance.getDate())) age--;
   return age;
 };
 
 const findColIndex = (headerRow, possibleNames) => {
   if (!headerRow || !Array.isArray(headerRow)) return -1;
 
+  // Match exact
   for (const name of possibleNames) {
-    const index = headerRow.findIndex((cell) => {
-      if (!cell || typeof cell !== 'string') return false;
-      return cell.trim().toLowerCase() === name.toLowerCase();
-    });
+    const index = headerRow.findIndex(
+      (cell) =>
+        cell && typeof cell === 'string' && cell.trim().toLowerCase() === name.toLowerCase()
+    );
     if (index !== -1) return index;
   }
 
+  // Match partiel
   for (const name of possibleNames) {
-    const index = headerRow.findIndex((cell) => {
-      if (!cell || typeof cell !== 'string') return false;
-      return cell.trim().toLowerCase().includes(name.toLowerCase());
-    });
+    const index = headerRow.findIndex(
+      (cell) =>
+        cell &&
+        typeof cell === 'string' &&
+        cell.trim().toLowerCase().includes(name.toLowerCase())
+    );
     if (index !== -1) return index;
   }
 
@@ -118,10 +128,9 @@ const extraireNomSFD = (rows) => {
 
   for (let i = 0; i < Math.min(20, rows.length); i++) {
     const row = rows[i];
-    if (!row || !Array.isArray(row)) continue;
+    if (!row) continue;
 
-    for (let j = 0; j < row.length; j++) {
-      const cell = row[j];
+    for (const cell of row) {
       if (cell && typeof cell === 'string') {
         for (const keyword of keywords) {
           if (cell.includes(keyword)) {
@@ -157,47 +166,45 @@ const extraireNomSFD = (rows) => {
 };
 
 const generateJobCode = () => {
-  const date = new Date();
-  const timestamp = date.getTime().toString(36).toUpperCase();
+  const timestamp = Date.now().toString(36).toUpperCase();
   const random = Math.random().toString(36).substring(2, 6).toUpperCase();
   return `JOB-${timestamp}-${random}`;
 };
 
 // ============================================================
-//  ROUTE : IMPORT REPORTING (SYNCHRONE)
+//  IMPORT REPORTING — VERSION OPTIMISÉE MÉMOIRE
 // ============================================================
 
 const importReporting = async (req, res) => {
-  const BATCH_SIZE = 500;
   let filePath = null;
   let job = null;
 
   try {
     if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'Aucun fichier fourni',
-      });
+      return res.status(400).json({ success: false, message: 'Aucun fichier fourni' });
     }
 
     filePath = req.file.path;
 
-    // 1. Créer un job
+    // ============================================================
+    // 1. Job de suivi
+    // ============================================================
     job = await Job.create({
       type: 'IMPORT_REPORTING',
       code: generateJobCode(),
       statut: 'PENDING',
-      donnees: {
-        fichier: req.file.originalname,
-        taille: req.file.size,
-      },
+      donnees: { fichier: req.file.originalname, taille: req.file.size },
       creePar: req.user._id,
       utilisateurId: req.user._id,
     });
 
-    // 2. Lire le fichier
+    // ============================================================
+    // 2. Lecture Excel (options mémoire optimisées)
+    // ============================================================
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(filePath);
+    await workbook.xlsx.readFile(filePath, {
+      ignoreNodes: ['dataValidations', 'extLst'],
+    });
 
     const sheetMensuel =
       workbook.getWorksheet('Mensuel OK') ||
@@ -223,7 +230,23 @@ const importReporting = async (req, res) => {
       });
     }
 
-    // 3. Paramètres PSB
+    // ============================================================
+    // 3. Garde-fou taille fichier
+    // ============================================================
+    const totalRows = sheetMensuel.actualRowCount || sheetMensuel.rowCount || 0;
+
+    if (totalRows > MAX_ROWS) {
+      await job.echouer(`Fichier trop volumineux (${totalRows} lignes, max ${MAX_ROWS})`);
+      await job.save();
+      return res.status(400).json({
+        success: false,
+        message: `Fichier trop volumineux : ${totalRows} lignes (maximum ${MAX_ROWS}). Contactez l'administrateur.`,
+      });
+    }
+
+    // ============================================================
+    // 4. Lecture paramètres PSB
+    // ============================================================
     const params = {};
     sheetPSB.eachRow({ includeEmpty: false }, (row) => {
       const key = row.getCell(1).text.trim();
@@ -232,23 +255,30 @@ const importReporting = async (req, res) => {
       params[key] = isNaN(numValue) ? value : numValue;
     });
 
-    // 4. Extraction des données brutes
-    const rawData = [];
-    sheetMensuel.eachRow({ includeEmpty: false }, (row) => {
+    // ============================================================
+    // 5. Preview : 30 premières lignes pour détection
+    // ============================================================
+    const previewRows = [];
+    for (let i = 1; i <= Math.min(PREVIEW_LIMIT, totalRows); i++) {
+      const row = sheetMensuel.getRow(i);
+      if (!row || !row.hasValues) {
+        previewRows.push([]);
+        continue;
+      }
       const rowData = [];
       row.eachCell({ includeEmpty: false }, (cell) => {
         rowData.push(cell.text);
       });
-      rawData.push(rowData);
-    });
-
-    // 5. Nom du SFD
-    let sfdName = extraireNomSFD(rawData);
-    if (!sfdName) {
-      sfdName = rawData[2] && rawData[2][5] ? rawData[2][5].trim() : 'SFD INCONNU';
+      previewRows.push(rowData);
     }
 
-    // 6. Trouver ou créer le SFD
+    // --- Détection nom SFD ---
+    let sfdName = extraireNomSFD(previewRows);
+    if (!sfdName) {
+      sfdName = previewRows[2] && previewRows[2][5] ? previewRows[2][5].trim() : 'SFD INCONNU';
+    }
+
+    // --- SFD : trouver ou créer ---
     let sfd = await SFD.findOne({ nom: sfdName });
     if (!sfd) {
       const code = sfdName.substring(0, 8).toUpperCase().replace(/ /g, '_');
@@ -261,7 +291,7 @@ const importReporting = async (req, res) => {
       });
     }
 
-    // 7. Trouver ou créer le contrat
+    // --- Contrat : trouver ou créer ---
     let contrat = await Contrat.findOne({ sfdId: sfd._id });
     const defaultAssureur = await getOrCreateDefaultAssureur();
 
@@ -286,27 +316,38 @@ const importReporting = async (req, res) => {
       });
     }
 
-    // 8. Trouver l'en-tête
-    let headerRowIndex = -1;
-    const headerKeywords = ['Identifiant emprunteur', 'Identifiant', 'ID', 'Nom emprunteur', 'Nom', 'NOM'];
+    // ============================================================
+    // 6. Détection ligne d'en-tête
+    // ============================================================
+    const headerKeywords = [
+      'Identifiant emprunteur',
+      'Identifiant',
+      'ID',
+      'Nom emprunteur',
+      'Nom',
+      'NOM',
+    ];
 
-    for (let i = 0; i < Math.min(30, rawData.length); i++) {
-      const row = rawData[i];
+    let headerRowIndex = -1;
+
+    for (let i = 0; i < previewRows.length; i++) {
+      const row = previewRows[i];
       if (!row || row.length === 0) continue;
+
       let matchCount = 0;
-      for (let j = 0; j < row.length; j++) {
-        const cell = row[j];
+      for (const cell of row) {
         if (cell && typeof cell === 'string') {
-          for (const keyword of headerKeywords) {
-            if (cell.includes(keyword)) {
+          for (const kw of headerKeywords) {
+            if (cell.includes(kw)) {
               matchCount++;
               break;
             }
           }
         }
       }
+
       if (matchCount >= 2) {
-        headerRowIndex = i;
+        headerRowIndex = i + 1;
         break;
       }
     }
@@ -320,10 +361,11 @@ const importReporting = async (req, res) => {
       });
     }
 
-    const headers = rawData[headerRowIndex];
-    const startRowIndex = headerRowIndex + 1;
+    const headers = previewRows[headerRowIndex - 1] || [];
 
-    // 9. Extraction colonnes
+    // ============================================================
+    // 7. Mapping des colonnes
+    // ============================================================
     const colIndex = {
       guichet: findColIndex(headers, ['Guichet']),
       localite: findColIndex(headers, ['Localité du Guichet', 'Localité']),
@@ -337,7 +379,11 @@ const importReporting = async (req, res) => {
       dateFinPret: findColIndex(headers, ['date de fin du prêt', 'Date fin prêt']),
       moisReporting: findColIndex(headers, ['Mois du reporting', 'Mois reporting']),
       datePret: findColIndex(headers, ['Date du prêt', 'Date prêt']),
-      dureePret: findColIndex(headers, ['durée du prêt (en nombre de mois)', 'durée du prêt', 'Durée prêt']),
+      dureePret: findColIndex(headers, [
+        'durée du prêt (en nombre de mois)',
+        'durée du prêt',
+        'Durée prêt',
+      ]),
       montantPret: findColIndex(headers, ['montant du prêt', 'Montant prêt']),
       typeCredit: findColIndex(headers, ['Type de crédit', 'Type crédit']),
       typePret: findColIndex(headers, ['Type de prêt', 'Type prêt']),
@@ -355,28 +401,26 @@ const importReporting = async (req, res) => {
       });
     }
 
-    // 10. Détection période
-    const moisNoms = [
-      'JANVIER', 'FEVRIER', 'MARS', 'AVRIL', 'MAI', 'JUIN',
-      'JUILLET', 'AOUT', 'SEPTEMBRE', 'OCTOBRE', 'NOVEMBRE', 'DECEMBRE',
-    ];
-
+    // ============================================================
+    // 8. Détection période (sur le preview uniquement)
+    // ============================================================
     let mois = 1;
     let annee = new Date().getFullYear();
     let dateFromReporting = false;
 
-    for (let i = startRowIndex; i < Math.min(startRowIndex + 10, rawData.length); i++) {
-      const row = rawData[i];
-      if (!row || row.length === 0) continue;
-      const moisReportingStr = row[colIndex.moisReporting]
-        ? row[colIndex.moisReporting].toString().trim()
+    for (let i = headerRowIndex; i < Math.min(headerRowIndex + 10, previewRows.length); i++) {
+      const row = previewRows[i];
+      if (!row) continue;
+
+      const moisStr = row[colIndex.moisReporting]
+        ? row[colIndex.moisReporting].toString().trim().toUpperCase()
         : '';
-      if (moisReportingStr) {
-        const cleanStr = moisReportingStr.toUpperCase().trim();
-        for (let m = 0; m < moisNoms.length; m++) {
-          if (cleanStr.includes(moisNoms[m])) {
+
+      if (moisStr) {
+        for (let m = 0; m < MOIS_NOMS_UPPER.length; m++) {
+          if (moisStr.includes(MOIS_NOMS_UPPER[m])) {
             mois = m + 1;
-            const yearMatch = cleanStr.match(/\b(20\d{2})\b/);
+            const yearMatch = moisStr.match(/\b(20\d{2})\b/);
             if (yearMatch) annee = parseInt(yearMatch[1]);
             dateFromReporting = true;
             break;
@@ -387,22 +431,15 @@ const importReporting = async (req, res) => {
     }
 
     if (!dateFromReporting || annee < 2000) {
-      let datePretReference = null;
-      for (let i = startRowIndex; i < rawData.length; i++) {
-        const row = rawData[i];
-        if (!row || row.length === 0) continue;
+      for (let i = headerRowIndex; i < previewRows.length; i++) {
+        const row = previewRows[i];
+        if (!row) continue;
         const datePret = toDate(row[colIndex.datePret]);
         if (datePret) {
-          datePretReference = datePret;
+          mois = datePret.getMonth() + 1;
+          annee = datePret.getFullYear();
           break;
         }
-      }
-      if (datePretReference) {
-        mois = datePretReference.getMonth() + 1;
-        annee = datePretReference.getFullYear();
-      } else {
-        mois = new Date().getMonth() + 1;
-        annee = new Date().getFullYear();
       }
     }
 
@@ -411,18 +448,21 @@ const importReporting = async (req, res) => {
     const dateDebut = new Date(annee, mois - 1, 1);
     const dateFin = new Date(annee, mois, 0);
 
-    // 11. Suppression ancien reporting
-    const existingReporting = await ReportingMensuel.findOne({
-      sfdId: sfd._id,
-      mois,
-      annee,
-    });
-    if (existingReporting) {
-      await Adhesion.deleteMany({ reportingMensuelId: existingReporting._id });
-      await ReportingMensuel.findByIdAndDelete(existingReporting._id);
+    // Libérer le preview
+    previewRows.length = 0;
+
+    // ============================================================
+    // 9. Suppression ancien reporting si existant
+    // ============================================================
+    const existing = await ReportingMensuel.findOne({ sfdId: sfd._id, mois, annee });
+    if (existing) {
+      await Adhesion.deleteMany({ reportingMensuelId: existing._id });
+      await ReportingMensuel.findByIdAndDelete(existing._id);
     }
 
-    // 12. Créer le reporting
+    // ============================================================
+    // 10. Création du reporting
+    // ============================================================
     const reporting = await ReportingMensuel.create({
       sfdId: sfd._id,
       contratId: contrat._id,
@@ -441,40 +481,59 @@ const importReporting = async (req, res) => {
       creePar: req.user._id,
     });
 
-    // 13. Traitement des lignes
+    // ============================================================
+    // 11. TRAITEMENT PRINCIPAL — ligne par ligne, batch libéré
+    // ============================================================
     const adhesionIds = [];
     const exclusionIds = [];
-    const adhesionDataArray = [];
     const erreurs = [];
     let totalAdhesions = 0;
     let totalExclusions = 0;
+    let batch = [];
+    let lastProgressUpdate = 0;
 
     job.demarrer();
     await job.save();
 
-    for (let i = startRowIndex; i < rawData.length; i++) {
-      const row = rawData[i];
-      if (!row || row.length === 0) continue;
+    const startTime = Date.now();
 
-      const hasData = row.some((cell) => cell !== undefined && cell !== null && cell !== '');
-      if (!hasData) continue;
+    for (let rowNumber = headerRowIndex + 1; rowNumber <= totalRows; rowNumber++) {
+      const row = sheetMensuel.getRow(rowNumber);
+      if (!row || !row.hasValues) continue;
 
-      const nom = row[colIndex.nom] ? row[colIndex.nom].toString().trim() : '';
-      if (!nom) continue;
+      const rowData = [];
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        rowData.push(cell.text);
+      });
 
-      const identifiant = row[colIndex.identifiant]
-        ? row[colIndex.identifiant].toString().trim()
-        : `ADH-${Date.now()}-${i}`;
-      const prenom = row[colIndex.prenom] ? row[colIndex.prenom].toString().trim() : '';
-      const montantPret = toNumber(row[colIndex.montantPret]);
-      const dureePret = toNumber(row[colIndex.dureePret]);
-      const datePret = toDate(row[colIndex.datePret]);
-      const dateNaissance = toDate(row[colIndex.dateNaissance]);
-      const dateFinPret = toDate(row[colIndex.dateFinPret]);
+      const hasData = rowData.some((c) => c !== undefined && c !== null && c !== '');
+      if (!hasData) {
+        rowData.length = 0;
+        continue;
+      }
+
+      const nom = rowData[colIndex.nom] ? rowData[colIndex.nom].toString().trim() : '';
+      if (!nom) {
+        rowData.length = 0;
+        continue;
+      }
+
+      const identifiant = rowData[colIndex.identifiant]
+        ? rowData[colIndex.identifiant].toString().trim()
+        : `ADH-${Date.now()}-${rowNumber}`;
+      const prenom = rowData[colIndex.prenom]
+        ? rowData[colIndex.prenom].toString().trim()
+        : '';
+      const montantPret = toNumber(rowData[colIndex.montantPret]);
+      const dureePret = toNumber(rowData[colIndex.dureePret]);
+      const datePret = toDate(rowData[colIndex.datePret]);
+      const dateNaissance = toDate(rowData[colIndex.dateNaissance]);
+      const dateFinPret = toDate(rowData[colIndex.dateFinPret]);
 
       const age = calculerAge(dateNaissance, datePret);
 
-      const controleDate = datePret && datePret >= dateDebut && datePret <= dateFin ? 'ok' : 'no';
+      const controleDate =
+        datePret && datePret >= dateDebut && datePret <= dateFin ? 'ok' : 'no';
       const controleAge =
         age >= contrat.ageMin &&
         age <= contrat.ageMaxDebut &&
@@ -501,36 +560,48 @@ const importReporting = async (req, res) => {
       const taxes = prime * contrat.tauxTaxe;
       const montantDu = prime + fraisGestion + taxes;
 
-      const sinistreValue = row[colIndex.sinistre]
-        ? row[colIndex.sinistre].toString().trim()
+      const sinistreValue = rowData[colIndex.sinistre]
+        ? rowData[colIndex.sinistre].toString().trim()
         : '';
-      const estSinistre = sinistreValue ? true : false;
+      const estSinistre = !!sinistreValue;
 
-      adhesionDataArray.push({
+      batch.push({
         reportingMensuelId: reporting._id,
         sfdId: sfd._id,
         contratId: contrat._id,
-        guichet: row[colIndex.guichet] ? row[colIndex.guichet].toString().trim() : '',
-        localite: row[colIndex.localite] ? row[colIndex.localite].toString().trim() : '',
+        guichet: rowData[colIndex.guichet]
+          ? rowData[colIndex.guichet].toString().trim()
+          : '',
+        localite: rowData[colIndex.localite]
+          ? rowData[colIndex.localite].toString().trim()
+          : '',
         identifiantEmprunteur: identifiant,
         nomEmprunteur: nom,
         prenomEmprunteur: prenom,
-        adresse: row[colIndex.adresse] ? row[colIndex.adresse].toString().trim() : '',
+        adresse: rowData[colIndex.adresse]
+          ? rowData[colIndex.adresse].toString().trim()
+          : '',
         dateNaissance,
-        profession: row[colIndex.profession] ? row[colIndex.profession].toString().trim() : '',
-        sexe: row[colIndex.sexe]
-          ? row[colIndex.sexe].toString().trim().toUpperCase()
+        profession: rowData[colIndex.profession]
+          ? rowData[colIndex.profession].toString().trim()
+          : '',
+        sexe: rowData[colIndex.sexe]
+          ? rowData[colIndex.sexe].toString().trim().toUpperCase()
           : '',
         dateFinPret,
-        moisReporting: row[colIndex.moisReporting]
-          ? row[colIndex.moisReporting].toString().trim()
+        moisReporting: rowData[colIndex.moisReporting]
+          ? rowData[colIndex.moisReporting].toString().trim()
           : '',
         datePret,
         dureePret,
         montantPret,
-        typeCredit: row[colIndex.typeCredit] ? row[colIndex.typeCredit].toString().trim() : '',
-        typePret: row[colIndex.typePret] ? row[colIndex.typePret].toString().trim() : '',
-        tauxInteretPret: toNumber(row[colIndex.tauxInteret]),
+        typeCredit: rowData[colIndex.typeCredit]
+          ? rowData[colIndex.typeCredit].toString().trim()
+          : '',
+        typePret: rowData[colIndex.typePret]
+          ? rowData[colIndex.typePret].toString().trim()
+          : '',
+        tauxInteretPret: toNumber(rowData[colIndex.tauxInteret]),
         prime,
         fraisGestion,
         taxes,
@@ -542,10 +613,16 @@ const importReporting = async (req, res) => {
         controleDuree,
         controleGlobal,
         nbMale:
-          row[colIndex.sexe] && row[colIndex.sexe].toString().toUpperCase() === 'M' ? 1 : 0,
+          rowData[colIndex.sexe] &&
+          rowData[colIndex.sexe].toString().toUpperCase() === 'M'
+            ? 1
+            : 0,
         nbFemale:
-          row[colIndex.sexe] && row[colIndex.sexe].toString().toUpperCase() === 'F' ? 1 : 0,
-        moisPret: parseInt(row[colIndex.moisPret]) || 0,
+          rowData[colIndex.sexe] &&
+          rowData[colIndex.sexe].toString().toUpperCase() === 'F'
+            ? 1
+            : 0,
+        moisPret: parseInt(rowData[colIndex.moisPret]) || 0,
         sinistre: {
           estSinistre,
           type: estSinistre ? 'DECES' : undefined,
@@ -570,14 +647,19 @@ const importReporting = async (req, res) => {
                 .filter(Boolean)
                 .join('; ')
             : '',
-        ligneOriginale: i + 1,
+        ligneOriginale: rowNumber,
         creePar: req.user._id,
       });
 
-      // Traitement par lot
-      if (adhesionDataArray.length >= BATCH_SIZE) {
+      // Libérer la ligne
+      rowData.length = 0;
+
+      // ============================================================
+      // Flush du batch
+      // ============================================================
+      if (batch.length >= BATCH_SIZE) {
         try {
-          const inserted = await Adhesion.insertMany(adhesionDataArray);
+          const inserted = await Adhesion.insertMany(batch, { ordered: false });
           inserted.forEach((doc) => {
             if (doc.estExclue) {
               exclusionIds.push(doc._id);
@@ -587,24 +669,31 @@ const importReporting = async (req, res) => {
               totalAdhesions++;
             }
           });
-          const progression = ((i - startRowIndex) / (rawData.length - startRowIndex)) * 100;
-          job.mettreAJourProgression(Math.round(progression));
-          await job.save();
         } catch (err) {
           erreurs.push({
-            ligne: i + 1,
+            ligne: rowNumber,
             message: err.message,
-            donnees: adhesionDataArray.length,
+            donnees: batch.length,
           });
         }
-        adhesionDataArray.length = 0;
+
+        batch.length = 0;
+
+        // Progression throttlée
+        const now = Date.now();
+        if (now - lastProgressUpdate > 1000) {
+          const progression = Math.round((rowNumber / totalRows) * 100);
+          job.mettreAJourProgression(progression);
+          await job.save();
+          lastProgressUpdate = now;
+        }
       }
     }
 
     // Dernier lot
-    if (adhesionDataArray.length > 0) {
+    if (batch.length > 0) {
       try {
-        const inserted = await Adhesion.insertMany(adhesionDataArray);
+        const inserted = await Adhesion.insertMany(batch, { ordered: false });
         inserted.forEach((doc) => {
           if (doc.estExclue) {
             exclusionIds.push(doc._id);
@@ -616,33 +705,50 @@ const importReporting = async (req, res) => {
         });
       } catch (err) {
         erreurs.push({
-          ligne: rawData.length,
+          ligne: 'final',
           message: err.message,
-          donnees: adhesionDataArray.length,
+          donnees: batch.length,
         });
       }
+      batch.length = 0;
     }
 
-    // 14. Mise à jour reporting
-    reporting.adhesions = adhesionIds;
-    reporting.exclusions.ids = exclusionIds;
-    reporting.nombreAdhesions = totalAdhesions;
-    reporting.nombreExclusions = totalExclusions;
-    reporting.erreursImport = erreurs;
-
-    const adhesions = await Adhesion.find({ _id: { $in: adhesionIds } });
+    // ============================================================
+    // 12. Calcul des totaux
+    // ============================================================
     let totalPrime = 0;
     let totalFraisGestion = 0;
     let totalTaxes = 0;
     let totalMontantDu = 0;
 
-    adhesions.forEach((adh) => {
-      totalPrime += adh.prime || 0;
-      totalFraisGestion += adh.fraisGestion || 0;
-      totalTaxes += adh.taxes || 0;
-      totalMontantDu += adh.montantDu || 0;
-    });
+    // Agrégation MongoDB directement (évite de charger tous les docs en RAM)
+    if (adhesionIds.length > 0) {
+      const totals = await Adhesion.aggregate([
+        { $match: { _id: { $in: adhesionIds } } },
+        {
+          $group: {
+            _id: null,
+            totalPrime: { $sum: '$prime' },
+            totalFraisGestion: { $sum: '$fraisGestion' },
+            totalTaxes: { $sum: '$taxes' },
+            totalMontantDu: { $sum: '$montantDu' },
+          },
+        },
+      ]);
 
+      if (totals.length > 0) {
+        totalPrime = totals[0].totalPrime || 0;
+        totalFraisGestion = totals[0].totalFraisGestion || 0;
+        totalTaxes = totals[0].totalTaxes || 0;
+        totalMontantDu = totals[0].totalMontantDu || 0;
+      }
+    }
+
+    reporting.adhesions = adhesionIds;
+    reporting.exclusions.ids = exclusionIds;
+    reporting.nombreAdhesions = totalAdhesions;
+    reporting.nombreExclusions = totalExclusions;
+    reporting.erreursImport = erreurs;
     reporting.totalPrime = totalPrime;
     reporting.totalFraisGestion = totalFraisGestion;
     reporting.totalTaxes = totalTaxes;
@@ -660,32 +766,42 @@ const importReporting = async (req, res) => {
 
     await reporting.save();
 
-    // 15. Création des sinistres
-    const sinistresAdhesions = await Adhesion.find({
-      _id: { $in: adhesionIds },
-      'sinistre.estSinistre': true,
-    });
+    // ============================================================
+    // 13. Création des sinistres (batch)
+    // ============================================================
+    if (adhesionIds.length > 0) {
+      const sinistresAdhesions = await Adhesion.find({
+        _id: { $in: adhesionIds },
+        'sinistre.estSinistre': true,
+      })
+        .select('_id datePret montantPret')
+        .lean();
 
-    for (const adh of sinistresAdhesions) {
-      await Sinistre.create({
-        adhesionId: adh._id,
-        sfdId: sfd._id,
-        reportingMensuelId: reporting._id,
-        contratId: contrat._id,
-        dateSinistre: adh.datePret || new Date(),
-        typeSinistre: 'DECES',
-        montantPret: adh.montantPret || 0,
-        capitalRestantDu: adh.montantPret || 0,
-        capitalRembourse: 0,
-        montantSinistre: adh.montantPret || 0,
-        montantPartSFD: adh.montantPret || 0,
-        montantPartAssure: 0,
-        statut: 'A_VERIFIER',
-        creePar: req.user._id,
-      });
+      if (sinistresAdhesions.length > 0) {
+        const sinistresData = sinistresAdhesions.map((adh) => ({
+          adhesionId: adh._id,
+          sfdId: sfd._id,
+          reportingMensuelId: reporting._id,
+          contratId: contrat._id,
+          dateSinistre: adh.datePret || new Date(),
+          typeSinistre: 'DECES',
+          montantPret: adh.montantPret || 0,
+          capitalRestantDu: adh.montantPret || 0,
+          capitalRembourse: 0,
+          montantSinistre: adh.montantPret || 0,
+          montantPartSFD: adh.montantPret || 0,
+          montantPartAssure: 0,
+          statut: 'A_VERIFIER',
+          creePar: req.user._id,
+        }));
+
+        await Sinistre.insertMany(sinistresData, { ordered: false });
+      }
     }
 
-    // 16. Créer/mettre à jour SuiviIntermediation
+    // ============================================================
+    // 14. Suivi intermédiation
+    // ============================================================
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: sfd._id, mois, annee },
       {
@@ -694,13 +810,15 @@ const importReporting = async (req, res) => {
         annee,
         reportingMensuelId: reporting._id,
         dateReceptionReporting: new Date(),
-        statut: totalExclusions > 0 ? 'EN_COURS' : 'EN_COURS',
-        creePar: req.user._id,
       },
       { upsert: true, new: true }
     );
 
-    // 17. Fin du job
+    // ============================================================
+    // 15. Fin du job
+    // ============================================================
+    const dureeMs = Date.now() - startTime;
+
     job.terminer(
       {
         reportingId: reporting._id,
@@ -708,16 +826,19 @@ const importReporting = async (req, res) => {
         totalExclusions,
         totalPrime,
         erreurs: erreurs.length,
+        dureeMs,
       },
-      `Import terminé: ${totalAdhesions} adhésions, ${totalExclusions} exclusions`
+      `Import terminé : ${totalAdhesions} adhésions, ${totalExclusions} exclusions en ${(dureeMs / 1000).toFixed(1)}s`
     );
     await job.save();
 
-    // 18. Nettoyage
+    // ============================================================
+    // 16. Nettoyage fichier temporaire
+    // ============================================================
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
-      } catch (err) {
+      } catch (e) {
         /* ignore */
       }
     }
@@ -732,12 +853,13 @@ const importReporting = async (req, res) => {
         totalExclusions,
         totalPrime,
         erreurs: erreurs.length,
+        dureeMs,
       },
     });
   } catch (error) {
     console.error('❌ Erreur import reporting:', error);
 
-    // Marquer le job en erreur
+    // Marquer le job en échec
     if (job) {
       try {
         await job.echouer(error.message);
@@ -747,10 +869,11 @@ const importReporting = async (req, res) => {
       }
     }
 
+    // Nettoyer le fichier temporaire
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
-      } catch (err) {
+      } catch (e) {
         /* ignore */
       }
     }
@@ -764,7 +887,7 @@ const importReporting = async (req, res) => {
 };
 
 // ============================================================
-//  ROUTE : SOUMETTRE UN IMPORT ASYNCHRONE (QUEUE)
+//  SOUMETTRE IMPORT ASYNCHRONE (QUEUE)
 // ============================================================
 
 const soumettreImportReporting = async (req, res) => {
@@ -803,7 +926,7 @@ const soumettreImportReporting = async (req, res) => {
 };
 
 // ============================================================
-//  ROUTES : GESTION DES REPORTINGS
+//  LISTE DES REPORTINGS
 // ============================================================
 
 const getReportings = async (req, res) => {
@@ -851,6 +974,10 @@ const getReportings = async (req, res) => {
   }
 };
 
+// ============================================================
+//  DÉTAILS D'UN REPORTING
+// ============================================================
+
 const getReportingById = async (req, res) => {
   try {
     const reporting = await ReportingMensuel.findById(req.params.id)
@@ -877,6 +1004,10 @@ const getReportingById = async (req, res) => {
     res.status(500).json({ success: false, message: 'Erreur' });
   }
 };
+
+// ============================================================
+//  ADHÉSIONS D'UN REPORTING
+// ============================================================
 
 const getAdhesionsByReporting = async (req, res) => {
   try {
@@ -925,6 +1056,10 @@ const getAdhesionsByReporting = async (req, res) => {
   }
 };
 
+// ============================================================
+//  RE-IMPORT D'UN FICHIER CORRIGÉ
+// ============================================================
+
 const reImporterReporting = async (req, res) => {
   try {
     const { id } = req.params;
@@ -968,7 +1103,7 @@ const reImporterReporting = async (req, res) => {
 };
 
 // ============================================================
-//  CLÔTURER UN REPORTING (avec génération des documents)
+//  CLÔTURER UN REPORTING
 // ============================================================
 
 const cloturerReporting = async (req, res) => {
@@ -994,14 +1129,12 @@ const cloturerReporting = async (req, res) => {
       });
     }
 
-    // --- 1. Marquer clôturé ---
     reporting.statut = STATUT_REPORTING.CLOTURE;
     reporting.dateCloture = new Date();
     reporting.cloturePar = req.user._id;
     reporting.modifiePar = req.user._id;
     await reporting.save();
 
-    // --- 2. Générer les documents ---
     let documents = null;
     try {
       documents = await genererDocumentsCloture(
@@ -1011,7 +1144,6 @@ const cloturerReporting = async (req, res) => {
         req.user
       );
 
-      // Sauvegarder les chemins
       reporting.documents = {
         appelCotisation: documents.appelCotisation,
         appelReglementSinistres: documents.appelReglementSinistres,
@@ -1023,7 +1155,6 @@ const cloturerReporting = async (req, res) => {
       console.error('⚠️ Erreur génération documents:', docError.message);
     }
 
-    // --- 3. Mettre à jour SuiviIntermediation ---
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: reporting.sfdId._id, mois: reporting.mois, annee: reporting.annee },
       {
@@ -1101,6 +1232,10 @@ const telechargerDocument = async (req, res) => {
     res.status(500).json({ success: false, message: 'Erreur téléchargement' });
   }
 };
+
+// ============================================================
+//  EXPORT
+// ============================================================
 
 module.exports = {
   importReporting,
