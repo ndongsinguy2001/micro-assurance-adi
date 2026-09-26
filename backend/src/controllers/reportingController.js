@@ -51,6 +51,149 @@ const getOrCreateDefaultAssureur = async () => {
   return assureur;
 };
 
+// ============================================================
+//  HELPERS ANTI-COLLISION
+// ============================================================
+
+/**
+ * Génère un code SFD unique à partir du nom
+ * Empêche les collisions (ex : "U-IMCEC" vs "U-IMCEC 2")
+ */
+const generateUniqueSFDCode = async (nom) => {
+  // Nettoyer : retirer accents et caractères spéciaux
+  let base = nom
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .substring(0, 8);
+
+  if (base.length < 3) base = 'SFD';
+
+  // Vérifier si le code est libre, sinon incrémenter
+  let code = base;
+  let counter = 1;
+
+  while (await SFD.exists({ code })) {
+    counter++;
+    const suffix = String(counter);
+    const maxBaseLen = Math.max(3, 10 - suffix.length - 1);
+    code = `${base.substring(0, maxBaseLen)}_${suffix}`;
+
+    if (counter > 999) {
+      // Fallback : timestamp
+      code = `SFD_${Date.now().toString(36).toUpperCase()}`;
+      break;
+    }
+  }
+
+  return code;
+};
+
+/**
+ * Trouve ou crée un SFD de manière atomique
+ * Gère la race condition si 2 imports tournent en même temps
+ */
+const getOrCreateSFD = async (nom, userId) => {
+  // 1. Essayer de trouver
+  let sfd = await SFD.findOne({ nom });
+  if (sfd) return sfd;
+
+  // 2. Générer un code unique et créer
+  const code = await generateUniqueSFDCode(nom);
+
+  try {
+    sfd = await SFD.create({
+      nom,
+      code,
+      pays: 'Sénégal',
+      statut: 'ACTIF',
+      creePar: userId,
+    });
+    return sfd;
+  } catch (err) {
+    // 3. Race condition : un autre import a créé le SFD entre-temps
+    if (err.code === 11000) {
+      // Réessayer de le trouver
+      sfd = await SFD.findOne({ nom });
+      if (sfd) return sfd;
+
+      // Sinon, retenter avec un code de fallback unique
+      const fallbackCode = `SFD_${Date.now().toString(36).toUpperCase()}`;
+      sfd = await SFD.create({
+        nom,
+        code: fallbackCode,
+        pays: 'Sénégal',
+        statut: 'ACTIF',
+        creePar: userId,
+      });
+      return sfd;
+    }
+    throw err;
+  }
+};
+
+/**
+ * Trouve ou crée un Contrat de manière atomique
+ */
+const getOrCreateContrat = async (sfd, params, defaultAssureur, userId) => {
+  // 1. Chercher
+  let contrat = await Contrat.findOne({ sfdId: sfd._id });
+  if (contrat) return contrat;
+
+  // 2. Créer avec code unique
+  let code = `CTR-${sfd.code}-001`;
+  let counter = 1;
+  while (await Contrat.exists({ code })) {
+    counter++;
+    code = `CTR-${sfd.code}-${String(counter).padStart(3, '0')}`;
+    if (counter > 999) {
+      code = `CTR-${sfd.code}-${Date.now().toString(36).toUpperCase()}`;
+      break;
+    }
+  }
+
+  try {
+    contrat = await Contrat.create({
+      nom: `Contrat ${sfd.nom}`,
+      code,
+      sfdId: sfd._id,
+      assureurId: defaultAssureur._id,
+      ageMin: params['Âge minimum'] || 18,
+      ageMaxDebut: params['Âge maximum début du prêt'] || 64,
+      ageMaxFin: params['Âge maximum fin du prêt'] || 65,
+      dureeMin: params['Durée minimum prêt'] || 1,
+      montantMin: params['Montant minimum du prêt'] || 0,
+      montantMax: params['Montant maximum du prêt'] || 25000000,
+      tauxPrime1: params['Taux de prime'] || 0.0065,
+      tauxPrime2: params['Taux de prime 2'] || 0.0163,
+      seuilPrime2: params['Montant maximum du prêt'] || 14000000,
+      tauxFraisGestion: params['Taux de frais de gestion'] || 0.08,
+      tauxTaxe: params['Taxe'] || 0,
+      creePar: userId,
+    });
+    return contrat;
+  } catch (err) {
+    if (err.code === 11000) {
+      contrat = await Contrat.findOne({ sfdId: sfd._id });
+      if (contrat) return contrat;
+    }
+    throw err;
+  }
+};
+
+/**
+ * Verrou anti-import simultané (en mémoire)
+ * Bloque un utilisateur de lancer 2 imports en parallèle
+ */
+const importsInProgress = new Set();
+
+// ============================================================
+//  HELPERS DE CONVERSION
+// ============================================================
+
 const excelDateToJSDate = (serial) => {
   if (!serial) return null;
   if (typeof serial === 'string') {
@@ -170,15 +313,28 @@ const generateJobCode = () => {
 };
 
 // ============================================================
-//  IMPORT REPORTING — VERSION OPTIMISÉE MÉMOIRE
+//  IMPORT REPORTING
 // ============================================================
 
 const importReporting = async (req, res) => {
   let filePath = null;
   let job = null;
+  const userId = req.user._id.toString();
+
+  // ✅ Verrou anti-import simultané
+  if (importsInProgress.has(userId)) {
+    return res.status(429).json({
+      success: false,
+      message:
+        'Un import est déjà en cours pour votre compte. Veuillez attendre qu\'il se termine avant d\'en lancer un nouveau.',
+    });
+  }
+
+  importsInProgress.add(userId);
 
   try {
     if (!req.file) {
+      importsInProgress.delete(userId);
       return res.status(400).json({ success: false, message: 'Aucun fichier fourni' });
     }
 
@@ -197,7 +353,7 @@ const importReporting = async (req, res) => {
     });
 
     // ============================================================
-    // 2. Lecture Excel (options mémoire optimisées)
+    // 2. Lecture Excel
     // ============================================================
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath, {
@@ -213,6 +369,7 @@ const importReporting = async (req, res) => {
     if (!sheetMensuel) {
       await job.echouer('Onglet "Mensuel OK" introuvable');
       await job.save();
+      importsInProgress.delete(userId);
       return res.status(400).json({
         success: false,
         message: 'L\'onglet "Mensuel OK" ou "Mensuel ok" est obligatoire',
@@ -222,6 +379,7 @@ const importReporting = async (req, res) => {
     if (!sheetPSB) {
       await job.echouer('Onglet "PSB" introuvable');
       await job.save();
+      importsInProgress.delete(userId);
       return res.status(400).json({
         success: false,
         message: 'L\'onglet "PSB" est obligatoire',
@@ -229,13 +387,14 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 3. Garde-fou taille fichier
+    // 3. Garde-fou taille
     // ============================================================
     const totalRows = sheetMensuel.actualRowCount || sheetMensuel.rowCount || 0;
 
     if (totalRows > MAX_ROWS) {
       await job.echouer(`Fichier trop volumineux (${totalRows} lignes, max ${MAX_ROWS})`);
       await job.save();
+      importsInProgress.delete(userId);
       return res.status(400).json({
         success: false,
         message: `Fichier trop volumineux : ${totalRows} lignes (maximum ${MAX_ROWS}). Contactez l'administrateur.`,
@@ -243,7 +402,7 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 4. Lecture paramètres PSB
+    // 4. Paramètres PSB
     // ============================================================
     const params = {};
     sheetPSB.eachRow({ includeEmpty: false }, (row) => {
@@ -254,7 +413,7 @@ const importReporting = async (req, res) => {
     });
 
     // ============================================================
-    // 5. Preview : 30 premières lignes pour détection
+    // 5. Preview (30 premières lignes)
     // ============================================================
     const previewRows = [];
     for (let i = 1; i <= Math.min(PREVIEW_LIMIT, totalRows); i++) {
@@ -276,43 +435,14 @@ const importReporting = async (req, res) => {
       sfdName = previewRows[2] && previewRows[2][5] ? previewRows[2][5].trim() : 'SFD INCONNU';
     }
 
-    // --- SFD : trouver ou créer ---
-    let sfd = await SFD.findOne({ nom: sfdName });
-    if (!sfd) {
-      const code = sfdName.substring(0, 8).toUpperCase().replace(/ /g, '_');
-      sfd = await SFD.create({
-        nom: sfdName,
-        code,
-        pays: 'Sénégal',
-        statut: 'ACTIF',
-        creePar: req.user._id,
-      });
-    }
+    // --- SFD : trouver ou créer (robuste aux race conditions) ---
+    const sfd = await getOrCreateSFD(sfdName, req.user._id);
 
-    // --- Contrat : trouver ou créer ---
-    let contrat = await Contrat.findOne({ sfdId: sfd._id });
+    // --- Assureur par défaut ---
     const defaultAssureur = await getOrCreateDefaultAssureur();
 
-    if (!contrat) {
-      contrat = await Contrat.create({
-        nom: `Contrat ${sfd.nom}`,
-        code: `CTR-${sfd.code}-001`,
-        sfdId: sfd._id,
-        assureurId: defaultAssureur._id,
-        ageMin: params['Âge minimum'] || 18,
-        ageMaxDebut: params['Âge maximum début du prêt'] || 64,
-        ageMaxFin: params['Âge maximum fin du prêt'] || 65,
-        dureeMin: params['Durée minimum prêt'] || 1,
-        montantMin: params['Montant minimum du prêt'] || 0,
-        montantMax: params['Montant maximum du prêt'] || 25000000,
-        tauxPrime1: params['Taux de prime'] || 0.0065,
-        tauxPrime2: params['Taux de prime 2'] || 0.0163,
-        seuilPrime2: params['Montant maximum du prêt'] || 14000000,
-        tauxFraisGestion: params['Taux de frais de gestion'] || 0.08,
-        tauxTaxe: params['Taxe'] || 0,
-        creePar: req.user._id,
-      });
-    }
+    // --- Contrat : trouver ou créer (robuste aux race conditions) ---
+    const contrat = await getOrCreateContrat(sfd, params, defaultAssureur, req.user._id);
 
     // ============================================================
     // 6. Détection ligne d'en-tête
@@ -353,6 +483,7 @@ const importReporting = async (req, res) => {
     if (headerRowIndex === -1) {
       await job.echouer('En-tête du fichier non trouvé');
       await job.save();
+      importsInProgress.delete(userId);
       return res.status(400).json({
         success: false,
         message: 'En-tête du fichier non trouvé',
@@ -393,6 +524,7 @@ const importReporting = async (req, res) => {
     if (colIndex.nom === -1) {
       await job.echouer('Colonne "Nom" non trouvée');
       await job.save();
+      importsInProgress.delete(userId);
       return res.status(400).json({
         success: false,
         message: 'Colonne "Nom" non trouvée dans le fichier',
@@ -790,7 +922,7 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 14. Suivi intermédiation — ✅ FIX returnDocument
+    // 14. Suivi intermédiation
     // ============================================================
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: sfd._id, mois, annee },
@@ -801,7 +933,7 @@ const importReporting = async (req, res) => {
         reportingMensuelId: reporting._id,
         dateReceptionReporting: new Date(),
       },
-      { upsert: true, returnDocument: 'after' }   // ✅ CORRIGÉ
+      { upsert: true, returnDocument: 'after' }
     );
 
     // ============================================================
@@ -833,6 +965,9 @@ const importReporting = async (req, res) => {
       }
     }
 
+    // ✅ Libérer le verrou AVANT de répondre
+    importsInProgress.delete(userId);
+
     res.status(201).json({
       success: true,
       message: 'Reporting importé avec succès',
@@ -847,6 +982,9 @@ const importReporting = async (req, res) => {
       },
     });
   } catch (error) {
+    // ✅ Libérer le verrou en cas d'erreur
+    importsInProgress.delete(userId);
+
     console.error('❌ Erreur import reporting:', error);
 
     if (job) {
@@ -1091,7 +1229,7 @@ const reImporterReporting = async (req, res) => {
 };
 
 // ============================================================
-//  CLÔTURER UN REPORTING — ✅ FIX returnDocument
+//  CLÔTURER UN REPORTING
 // ============================================================
 
 const cloturerReporting = async (req, res) => {
@@ -1150,7 +1288,7 @@ const cloturerReporting = async (req, res) => {
         dateEnvoiDocuments: new Date(),
         statut: 'EN_COURS',
       },
-      { upsert: true, returnDocument: 'after' }   // ✅ CORRIGÉ
+      { upsert: true, returnDocument: 'after' }
     );
 
     res.status(200).json({
