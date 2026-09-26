@@ -5,11 +5,6 @@ const Statistique = require('../models/Statistique');
 // 1. CRÉER OU METTRE À JOUR UNE STATISTIQUE MENSUELLE
 // ============================================================
 
-/**
- * @route   POST /api/statistiques
- * @desc    Créer ou mettre à jour une statistique mensuelle
- * @access  Private (ADMIN)
- */
 const upsertStatistique = async (req, res) => {
   try {
     const { pays, annee, mois, ...data } = req.body;
@@ -24,7 +19,7 @@ const upsertStatistique = async (req, res) => {
     const statistique = await Statistique.findOneAndUpdate(
       { pays, annee, mois },
       { ...data, modifiePar: req.user._id },
-      { new: true, upsert: true, runValidators: true }
+      { returnDocument: 'after', upsert: true, runValidators: true }   // ✅ CORRIGÉ
     );
 
     res.status(201).json({
@@ -46,11 +41,6 @@ const upsertStatistique = async (req, res) => {
 // 2. LISTE DES STATISTIQUES
 // ============================================================
 
-/**
- * @route   GET /api/statistiques
- * @desc    Liste des statistiques avec filtres
- * @access  Private
- */
 const getStatistiques = async (req, res) => {
   try {
     const { pays, annee, mois, limit = 100, page = 1 } = req.query;
@@ -93,11 +83,6 @@ const getStatistiques = async (req, res) => {
 // 3. STATISTIQUES AGRÉGÉES PAR ANNÉE
 // ============================================================
 
-/**
- * @route   GET /api/statistiques/agregat
- * @desc    Statistiques agrégées par année
- * @access  Private
- */
 const getAgregat = async (req, res) => {
   try {
     const { pays, annee } = req.query;
@@ -118,7 +103,6 @@ const getAgregat = async (req, res) => {
       });
     }
 
-    // Structure des données par mois
     const moisData = {
       nbHommes: [],
       nbFemmes: [],
@@ -157,7 +141,6 @@ const getAgregat = async (req, res) => {
       montantPayeAllianz: 0,
     };
 
-    // Remplir les données
     stats.forEach((s) => {
       moisLabels.push(moisNoms[s.mois - 1]);
       moisData.nbHommes.push(s.nbHommes || 0);
@@ -174,7 +157,6 @@ const getAgregat = async (req, res) => {
       moisData.commissionsEncaissees.push(s.commissionsEncaissees || 0);
       moisData.montantPayeAllianz.push(s.montantPayeAllianz || 0);
 
-      // Totaux
       totals.nbHommes += s.nbHommes || 0;
       totals.nbFemmes += s.nbFemmes || 0;
       totals.nbPM += s.nbPM || 0;
@@ -214,11 +196,6 @@ const getAgregat = async (req, res) => {
 // 4. SUPPRIMER UNE STATISTIQUE
 // ============================================================
 
-/**
- * @route   DELETE /api/statistiques/:id
- * @desc    Supprimer une statistique
- * @access  Private (ADMIN)
- */
 const deleteStatistique = async (req, res) => {
   try {
     const { id } = req.params;

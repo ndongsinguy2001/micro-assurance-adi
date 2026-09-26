@@ -100,7 +100,6 @@ const calculerAge = (dateNaissance, dateReference) => {
 const findColIndex = (headerRow, possibleNames) => {
   if (!headerRow || !Array.isArray(headerRow)) return -1;
 
-  // Match exact
   for (const name of possibleNames) {
     const index = headerRow.findIndex(
       (cell) =>
@@ -109,7 +108,6 @@ const findColIndex = (headerRow, possibleNames) => {
     if (index !== -1) return index;
   }
 
-  // Match partiel
   for (const name of possibleNames) {
     const index = headerRow.findIndex(
       (cell) =>
@@ -402,7 +400,7 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 8. Détection période (sur le preview uniquement)
+    // 8. Détection période
     // ============================================================
     let mois = 1;
     let annee = new Date().getFullYear();
@@ -448,7 +446,6 @@ const importReporting = async (req, res) => {
     const dateDebut = new Date(annee, mois - 1, 1);
     const dateFin = new Date(annee, mois, 0);
 
-    // Libérer le preview
     previewRows.length = 0;
 
     // ============================================================
@@ -482,7 +479,7 @@ const importReporting = async (req, res) => {
     });
 
     // ============================================================
-    // 11. TRAITEMENT PRINCIPAL — ligne par ligne, batch libéré
+    // 11. TRAITEMENT PRINCIPAL — ligne par ligne
     // ============================================================
     const adhesionIds = [];
     const exclusionIds = [];
@@ -651,12 +648,8 @@ const importReporting = async (req, res) => {
         creePar: req.user._id,
       });
 
-      // Libérer la ligne
       rowData.length = 0;
 
-      // ============================================================
-      // Flush du batch
-      // ============================================================
       if (batch.length >= BATCH_SIZE) {
         try {
           const inserted = await Adhesion.insertMany(batch, { ordered: false });
@@ -679,7 +672,6 @@ const importReporting = async (req, res) => {
 
         batch.length = 0;
 
-        // Progression throttlée
         const now = Date.now();
         if (now - lastProgressUpdate > 1000) {
           const progression = Math.round((rowNumber / totalRows) * 100);
@@ -690,7 +682,6 @@ const importReporting = async (req, res) => {
       }
     }
 
-    // Dernier lot
     if (batch.length > 0) {
       try {
         const inserted = await Adhesion.insertMany(batch, { ordered: false });
@@ -714,14 +705,13 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 12. Calcul des totaux
+    // 12. Totaux
     // ============================================================
     let totalPrime = 0;
     let totalFraisGestion = 0;
     let totalTaxes = 0;
     let totalMontantDu = 0;
 
-    // Agrégation MongoDB directement (évite de charger tous les docs en RAM)
     if (adhesionIds.length > 0) {
       const totals = await Adhesion.aggregate([
         { $match: { _id: { $in: adhesionIds } } },
@@ -767,7 +757,7 @@ const importReporting = async (req, res) => {
     await reporting.save();
 
     // ============================================================
-    // 13. Création des sinistres (batch)
+    // 13. Sinistres
     // ============================================================
     if (adhesionIds.length > 0) {
       const sinistresAdhesions = await Adhesion.find({
@@ -800,7 +790,7 @@ const importReporting = async (req, res) => {
     }
 
     // ============================================================
-    // 14. Suivi intermédiation
+    // 14. Suivi intermédiation — ✅ FIX returnDocument
     // ============================================================
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: sfd._id, mois, annee },
@@ -811,7 +801,7 @@ const importReporting = async (req, res) => {
         reportingMensuelId: reporting._id,
         dateReceptionReporting: new Date(),
       },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }   // ✅ CORRIGÉ
     );
 
     // ============================================================
@@ -833,7 +823,7 @@ const importReporting = async (req, res) => {
     await job.save();
 
     // ============================================================
-    // 16. Nettoyage fichier temporaire
+    // 16. Nettoyage
     // ============================================================
     if (filePath && fs.existsSync(filePath)) {
       try {
@@ -859,7 +849,6 @@ const importReporting = async (req, res) => {
   } catch (error) {
     console.error('❌ Erreur import reporting:', error);
 
-    // Marquer le job en échec
     if (job) {
       try {
         await job.echouer(error.message);
@@ -869,7 +858,6 @@ const importReporting = async (req, res) => {
       }
     }
 
-    // Nettoyer le fichier temporaire
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
@@ -887,7 +875,7 @@ const importReporting = async (req, res) => {
 };
 
 // ============================================================
-//  SOUMETTRE IMPORT ASYNCHRONE (QUEUE)
+//  SOUMETTRE IMPORT ASYNCHRONE
 // ============================================================
 
 const soumettreImportReporting = async (req, res) => {
@@ -1057,7 +1045,7 @@ const getAdhesionsByReporting = async (req, res) => {
 };
 
 // ============================================================
-//  RE-IMPORT D'UN FICHIER CORRIGÉ
+//  RE-IMPORT FICHIER CORRIGÉ
 // ============================================================
 
 const reImporterReporting = async (req, res) => {
@@ -1103,7 +1091,7 @@ const reImporterReporting = async (req, res) => {
 };
 
 // ============================================================
-//  CLÔTURER UN REPORTING
+//  CLÔTURER UN REPORTING — ✅ FIX returnDocument
 // ============================================================
 
 const cloturerReporting = async (req, res) => {
@@ -1162,7 +1150,7 @@ const cloturerReporting = async (req, res) => {
         dateEnvoiDocuments: new Date(),
         statut: 'EN_COURS',
       },
-      { upsert: true }
+      { upsert: true, returnDocument: 'after' }   // ✅ CORRIGÉ
     );
 
     res.status(200).json({
@@ -1183,7 +1171,7 @@ const cloturerReporting = async (req, res) => {
 };
 
 // ============================================================
-//  TÉLÉCHARGER UN DOCUMENT GÉNÉRÉ
+//  TÉLÉCHARGER UN DOCUMENT
 // ============================================================
 
 const telechargerDocument = async (req, res) => {
@@ -1232,10 +1220,6 @@ const telechargerDocument = async (req, res) => {
     res.status(500).json({ success: false, message: 'Erreur téléchargement' });
   }
 };
-
-// ============================================================
-//  EXPORT
-// ============================================================
 
 module.exports = {
   importReporting,
