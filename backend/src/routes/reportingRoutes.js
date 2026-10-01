@@ -14,6 +14,10 @@ const {
   reImporterReporting,
   cloturerReporting,
   telechargerDocument,
+  getImportJobById,
+  getIgnoredLines,      // 🔹 Phase 5.7
+  getImportHistory,
+  getImportJobs,
 } = require('../controllers/reportingController');
 
 const tempDir = './uploads';
@@ -37,7 +41,11 @@ const upload = multer({
       'application/vnd.ms-excel',
     ];
     if (allowedTypes.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Seuls les fichiers Excel sont autorisés (.xlsx, .xls)'), false);
+    else
+      cb(
+        new Error('Seuls les fichiers Excel sont autorisés (.xlsx, .xls)'),
+        false
+      );
   },
 });
 
@@ -68,6 +76,34 @@ router.post(
 );
 
 // ============================================================
+// IMPORTJOBS (⚠️ AVANT /:id pour éviter conflits)
+// ============================================================
+router.get(
+  '/jobs',
+  restrictTo('GESTIONNAIRE_IG', 'ADMIN'),
+  getImportJobs
+);
+
+router.get(
+  '/jobs/history',
+  restrictTo('GESTIONNAIRE_IG', 'ADMIN'),
+  getImportHistory
+);
+
+// 🔹 Phase 5.7 — Lignes ignorées paginées
+router.get(
+  '/jobs/:id/ignored-lines',
+  restrictTo('GESTIONNAIRE_IG', 'ADMIN'),
+  getIgnoredLines
+);
+
+router.get(
+  '/jobs/:id',
+  restrictTo('GESTIONNAIRE_IG', 'ADMIN'),
+  getImportJobById
+);
+
+// ============================================================
 // CONSULTATION
 // ============================================================
 router.get('/', getReportings);
@@ -77,7 +113,11 @@ router.get('/:id/adhesions', getAdhesionsByReporting);
 // ============================================================
 // WORKFLOW
 // ============================================================
-router.post('/:id/cloturer', restrictTo('GESTIONNAIRE_IG', 'ADMIN'), cloturerReporting);
+router.post(
+  '/:id/cloturer',
+  restrictTo('GESTIONNAIRE_IG', 'ADMIN'),
+  cloturerReporting
+);
 
 // ============================================================
 // TÉLÉCHARGEMENT DOCUMENTS

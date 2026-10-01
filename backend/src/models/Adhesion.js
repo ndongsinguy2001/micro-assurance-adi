@@ -3,6 +3,72 @@ const mongoose = require('mongoose');
 
 /**
  * 👤 Adhesion - Adhésion individuelle d'un emprunteur
+ *
+ * ⚠️ Phase 5.1 — Champs de traçabilité ajoutés :
+ *    - importJobId, sheetName, sourceRowNumber
+ *    - rawData, normalizedData
+ *    - validationResults[], exclusionReasons[]
+ *    - status (limité à VALID / EXCLUDED en 5.1)
+ *
+ * ⚠️ Phase 5.3 — Ajout de `reportingLifecycle` :
+ *    - Dénormalisation du cycle de vie du reporting parent
+ *    - Permet de filtrer les adhésions ACTIVE / SUPERSEDED
+ *      SANS faire de $lookup coûteux
+ *    - Mis à jour automatiquement par idempotencyService
+ *      lors d'un remplacement de reporting
+ *
+ * ============================================================
+ * 📌 DOCUMENTATION DES CHAMPS DE TRAÇABILITÉ
+ * ============================================================
+ *
+ * ── rawData ──
+ *   Objet brut extrait de la ligne Excel via `cell.text` d'ExcelJS.
+ *   Format : { col_0: '...', col_1: '...', ..., col_N: '...' }
+ *   ⚠️ LIMITE CONNUE : ExcelJS `cell.text` renvoie une REPRÉSENTATION
+ *      TEXTE de la cellule, PAS la valeur native (Date, Number, Boolean).
+ *      Ainsi, une cellule contenant la date 27/01/2020 sera
+ *      potentiellement stockée comme '27/01/2020' ou '44192' selon
+ *      le format d'affichage.
+ *      Cela signifie que rawData n'est PAS un clone fidèle du classeur
+ *      Excel, mais une lecture texte ligne par ligne.
+ *
+ * ── normalizedData ──
+ *   Valeurs après application des conversions du pipeline :
+ *     - trim + suppression espaces superflus
+ *     - conversion de dates (toDate)
+ *     - conversion de nombres (toNumber)
+ *     - mise en majuscules du sexe
+ *   Format : objet plat documenté (nom, prenom, identifiant, etc.)
+ *
+ * ── validationResults[] ──
+ *   Un élément par contrôle métier appliqué à la ligne.
+ *   ⚠️ En Phase 5.1/5.4 : 4 éléments correspondant aux 4 contrôles actuels
+ *      (RULE-001 à RULE-004).
+ *      Le nombre d'éléments évoluera avec le ruleEngine.
+ *
+ * ── exclusionReasons[] ──
+ *   Un élément par règle métier échouée.
+ *   ⚠️ En Phase 5.1/5.4 : dérivé des 4 contrôles actuels.
+ *
+ * ── status ──
+ *   ⚠️ En Phase 5.1 : uniquement 'VALID' ou 'EXCLUDED'.
+ *
+ * ── reportingLifecycle (Phase 5.3) ──
+ *   Dénormalisation du statut du reporting parent :
+ *     - 'ACTIVE'     : reporting actif
+ *     - 'SUPERSEDED' : reporting remplacé par un import plus récent
+ *
+ * ============================================================
+ * 📌 PIPELINE DE TRANSFORMATION D'UNE LIGNE
+ * ============================================================
+ *
+ *   RAW (rawData : cell.text brut)
+ *     ↓
+ *   NORMALIZED (normalizedData : conversions appliquées)
+ *     ↓
+ *   VALIDATED (validationResults[] : contrôles évalués)
+ *     ↓
+ *   PERSISTED (document Adhesion avec status final)
  */
 const AdhesionSchema = new mongoose.Schema(
   {
@@ -38,11 +104,7 @@ const AdhesionSchema = new mongoose.Schema(
     },
     prenomEmprunteur: { type: String, trim: true },
     adresse: { type: String, trim: true },
-    dateNaissance: {
-      type: Date,
-      // ✅ Optionnel : certaines lignes d'import Excel n'ont pas la date
-      // La validation métier est faite via controleAge dans le controller
-    },
+    dateNaissance: { type: Date },
     profession: { type: String, trim: true },
     sexe: {
       type: String,
@@ -117,10 +179,7 @@ const AdhesionSchema = new mongoose.Schema(
       enum: ['ok', 'no'],
       default: 'ok',
     },
-    motifExclusion: {
-      type: String,
-      trim: true,
-    },
+    motifExclusion: { type: String, trim: true },
 
     // ============================================================
     // 6. STATISTIQUES
@@ -134,10 +193,7 @@ const AdhesionSchema = new mongoose.Schema(
     // ============================================================
     sinistre: {
       estSinistre: { type: Boolean, default: false },
-      type: {
-        type: String,
-        enum: ['DECES', 'INVALIDITE', 'AUTRE'],
-      },
+      type: { type: String, enum: ['DECES', 'INVALIDITE', 'AUTRE'] },
       date: Date,
       montant: Number,
       statut: {
@@ -157,7 +213,7 @@ const AdhesionSchema = new mongoose.Schema(
     },
 
     // ============================================================
-    // 9. TRACABILITÉ
+    // 9. TRACABILITÉ (existant)
     // ============================================================
     ligneOriginale: { type: Number },
     estExclue: { type: Boolean, default: false },
@@ -167,9 +223,63 @@ const AdhesionSchema = new mongoose.Schema(
       ref: 'User',
       required: [true, 'L\'utilisateur créateur est obligatoire'],
     },
-    modifiePar: {
+    modifiePar: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+
+    // ============================================================
+    // 10. TRACABILITÉ PHASE 5.1 — CHAMPS OPTIONNELS
+    // ============================================================
+    importJobId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      ref: 'ImportJob',
+      default: null,
+      index: true,
+    },
+    sheetName: { type: String, trim: true, default: null },
+    sourceRowNumber: { type: Number, default: null },
+
+    rawData: { type: mongoose.Schema.Types.Mixed, default: null },
+    normalizedData: { type: mongoose.Schema.Types.Mixed, default: null },
+
+    validationResults: [
+      {
+        ruleId: { type: String, trim: true },
+        field: { type: String, trim: true },
+        passed: { type: Boolean, default: false },
+        message: { type: String, trim: true, default: '' },
+        originalValue: { type: mongoose.Schema.Types.Mixed, default: null },
+        normalizedValue: { type: mongoose.Schema.Types.Mixed, default: null },
+        expectedValue: { type: mongoose.Schema.Types.Mixed, default: null },
+      },
+    ],
+
+    exclusionReasons: [
+      {
+        ruleId: { type: String, trim: true },
+        field: { type: String, trim: true },
+        code: { type: String, trim: true },
+        message: { type: String, trim: true },
+        originalValue: { type: mongoose.Schema.Types.Mixed, default: null },
+        normalizedValue: { type: mongoose.Schema.Types.Mixed, default: null },
+        expectedValue: { type: mongoose.Schema.Types.Mixed, default: null },
+      },
+    ],
+
+    status: {
+      type: String,
+      enum: ['VALID', 'EXCLUDED'],
+      default: 'VALID',
+      index: true,
+    },
+
+    // ============================================================
+    // 11. PHASE 5.3 — CYCLE DE VIE DU REPORTING PARENT
+    // ============================================================
+    // ⚠️ L'index est déclaré plus bas (AdhesionSchema.index)
+    //    NE PAS ajouter `index: true` ici (warning Mongoose).
+    reportingLifecycle: {
+      type: String,
+      enum: ['ACTIVE', 'SUPERSEDED'],
+      default: 'ACTIVE',
     },
   },
   {
@@ -186,6 +296,9 @@ AdhesionSchema.index({ sfdId: 1, moisReporting: 1 });
 AdhesionSchema.index({ 'sinistre.estSinistre': 1 });
 AdhesionSchema.index({ estExclue: 1 });
 AdhesionSchema.index({ reportingMensuelId: 1 });
+
+// 🔹 Phase 5.3 — Index dédié (évite $lookup pour filtrer par lifecycle)
+AdhesionSchema.index({ reportingLifecycle: 1 });
 
 // ============================================================
 // VIRTUAL
@@ -205,4 +318,10 @@ AdhesionSchema.methods.estSinistre = function () {
   return this.sinistre.estSinistre;
 };
 
-module.exports = mongoose.models.Adhesion || mongoose.model('Adhesion', AdhesionSchema);
+AdhesionSchema.methods.markSuperseded = function () {
+  this.reportingLifecycle = 'SUPERSEDED';
+  return this;
+};
+
+module.exports =
+  mongoose.models.Adhesion || mongoose.model('Adhesion', AdhesionSchema);

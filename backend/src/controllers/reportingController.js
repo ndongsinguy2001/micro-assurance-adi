@@ -10,8 +10,21 @@ const Adhesion = require('../models/Adhesion');
 const Sinistre = require('../models/Sinistre');
 const Job = require('../models/Job');
 const SuiviIntermediation = require('../models/SuiviIntermediation');
+const ImportJob = require('../models/ImportJob');
+const fileHashService = require('../services/fileHashService');
+const importStatsService = require('../services/importStatsService');
+const periodDetector = require('../services/periodDetector');
+const idempotencyService = require('../services/idempotencyService');
+const ruleEngine = require('../services/ruleEngine');
 const { addImportJob } = require('../services/queueService');
 const { genererDocumentsCloture } = require('../services/documentsMensuelsService');
+const {
+  ADHESION_LIGHT_PROJECTION,
+  IMPORT_JOB_LIGHT_PROJECTION,
+  IMPORT_JOB_DETAIL_PROJECTION,  // 🔹 Phase 5.7
+  REPORTING_LIGHT_PROJECTION,
+  getProjection,
+} = require('../constants/projections');
 
 // ============================================================
 //  CONSTANTES
@@ -51,16 +64,7 @@ const getOrCreateDefaultAssureur = async () => {
   return assureur;
 };
 
-// ============================================================
-//  HELPERS ANTI-COLLISION
-// ============================================================
-
-/**
- * Génère un code SFD unique à partir du nom
- * Empêche les collisions (ex : "U-IMCEC" vs "U-IMCEC 2")
- */
 const generateUniqueSFDCode = async (nom) => {
-  // Nettoyer : retirer accents et caractères spéciaux
   let base = nom
     .toUpperCase()
     .normalize('NFD')
@@ -72,7 +76,6 @@ const generateUniqueSFDCode = async (nom) => {
 
   if (base.length < 3) base = 'SFD';
 
-  // Vérifier si le code est libre, sinon incrémenter
   let code = base;
   let counter = 1;
 
@@ -83,7 +86,6 @@ const generateUniqueSFDCode = async (nom) => {
     code = `${base.substring(0, maxBaseLen)}_${suffix}`;
 
     if (counter > 999) {
-      // Fallback : timestamp
       code = `SFD_${Date.now().toString(36).toUpperCase()}`;
       break;
     }
@@ -92,16 +94,10 @@ const generateUniqueSFDCode = async (nom) => {
   return code;
 };
 
-/**
- * Trouve ou crée un SFD de manière atomique
- * Gère la race condition si 2 imports tournent en même temps
- */
 const getOrCreateSFD = async (nom, userId) => {
-  // 1. Essayer de trouver
   let sfd = await SFD.findOne({ nom });
   if (sfd) return sfd;
 
-  // 2. Générer un code unique et créer
   const code = await generateUniqueSFDCode(nom);
 
   try {
@@ -114,13 +110,10 @@ const getOrCreateSFD = async (nom, userId) => {
     });
     return sfd;
   } catch (err) {
-    // 3. Race condition : un autre import a créé le SFD entre-temps
     if (err.code === 11000) {
-      // Réessayer de le trouver
       sfd = await SFD.findOne({ nom });
       if (sfd) return sfd;
 
-      // Sinon, retenter avec un code de fallback unique
       const fallbackCode = `SFD_${Date.now().toString(36).toUpperCase()}`;
       sfd = await SFD.create({
         nom,
@@ -135,15 +128,10 @@ const getOrCreateSFD = async (nom, userId) => {
   }
 };
 
-/**
- * Trouve ou crée un Contrat de manière atomique
- */
 const getOrCreateContrat = async (sfd, params, defaultAssureur, userId) => {
-  // 1. Chercher
   let contrat = await Contrat.findOne({ sfdId: sfd._id });
   if (contrat) return contrat;
 
-  // 2. Créer avec code unique
   let code = `CTR-${sfd.code}-001`;
   let counter = 1;
   while (await Contrat.exists({ code })) {
@@ -184,10 +172,6 @@ const getOrCreateContrat = async (sfd, params, defaultAssureur, userId) => {
   }
 };
 
-/**
- * Verrou anti-import simultané (en mémoire)
- * Bloque un utilisateur de lancer 2 imports en parallèle
- */
 const importsInProgress = new Set();
 
 // ============================================================
@@ -246,7 +230,9 @@ const findColIndex = (headerRow, possibleNames) => {
   for (const name of possibleNames) {
     const index = headerRow.findIndex(
       (cell) =>
-        cell && typeof cell === 'string' && cell.trim().toLowerCase() === name.toLowerCase()
+        cell &&
+        typeof cell === 'string' &&
+        cell.trim().toLowerCase() === name.toLowerCase()
     );
     if (index !== -1) return index;
   }
@@ -265,7 +251,9 @@ const findColIndex = (headerRow, possibleNames) => {
 };
 
 const extraireNomSFD = (rows) => {
-  const keywords = ['Suivi', 'IMCEC', 'PAMECAS', 'RMRC', 'ACE', 'CITIZEN', 'PASBO', 'PADME'];
+  const keywords = [
+    'Suivi', 'IMCEC', 'PAMECAS', 'RMRC', 'ACE', 'CITIZEN', 'PASBO', 'PADME',
+  ];
 
   for (let i = 0; i < Math.min(20, rows.length); i++) {
     const row = rows[i];
@@ -291,7 +279,11 @@ const extraireNomSFD = (rows) => {
                 let name = part;
                 if (k + 1 < parts.length && !isNaN(parts[k + 1])) {
                   name += ' ' + parts[k + 1];
-                  if (k + 2 < parts.length && parts[k + 2] && !isNaN(parts[k + 2])) {
+                  if (
+                    k + 2 < parts.length &&
+                    parts[k + 2] &&
+                    !isNaN(parts[k + 2])
+                  ) {
                     name += ' ' + parts[k + 2];
                   }
                 }
@@ -319,12 +311,17 @@ const generateJobCode = () => {
 const importReporting = async (req, res) => {
   let filePath = null;
   let job = null;
+  let importJob = null;
   const userId = req.user._id.toString();
 
-  // ✅ Verrou anti-import simultané
+  const forceReplace =
+    req.body.forceReplace === true || req.body.forceReplace === 'true';
+  const replacementReason = req.body.replacementReason || null;
+
   if (importsInProgress.has(userId)) {
-    return res.status(429).json({
+    return res.status(423).json({
       success: false,
+      error: 'IMPORT_IN_PROGRESS',
       message:
         'Un import est déjà en cours pour votre compte. Veuillez attendre qu\'il se termine avant d\'en lancer un nouveau.',
     });
@@ -335,14 +332,30 @@ const importReporting = async (req, res) => {
   try {
     if (!req.file) {
       importsInProgress.delete(userId);
-      return res.status(400).json({ success: false, message: 'Aucun fichier fourni' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Aucun fichier fourni' });
     }
 
     filePath = req.file.path;
 
-    // ============================================================
-    // 1. Job de suivi
-    // ============================================================
+    const fileHash = await fileHashService.computeFileHash(filePath);
+
+    if (!fileHash) {
+      importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
+      return res.status(422).json({
+        success: false,
+        error: 'FILE_HASH_UNAVAILABLE',
+        message:
+          'Impossible de calculer l\'empreinte du fichier. Vérifiez que le fichier est lisible et non corrompu.',
+      });
+    }
+
     job = await Job.create({
       type: 'IMPORT_REPORTING',
       code: generateJobCode(),
@@ -352,9 +365,6 @@ const importReporting = async (req, res) => {
       utilisateurId: req.user._id,
     });
 
-    // ============================================================
-    // 2. Lecture Excel
-    // ============================================================
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath, {
       ignoreNodes: ['dataValidations', 'extLst'],
@@ -370,6 +380,11 @@ const importReporting = async (req, res) => {
       await job.echouer('Onglet "Mensuel OK" introuvable');
       await job.save();
       importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
       return res.status(400).json({
         success: false,
         message: 'L\'onglet "Mensuel OK" ou "Mensuel ok" est obligatoire',
@@ -380,30 +395,37 @@ const importReporting = async (req, res) => {
       await job.echouer('Onglet "PSB" introuvable');
       await job.save();
       importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
       return res.status(400).json({
         success: false,
         message: 'L\'onglet "PSB" est obligatoire',
       });
     }
 
-    // ============================================================
-    // 3. Garde-fou taille
-    // ============================================================
-    const totalRows = sheetMensuel.actualRowCount || sheetMensuel.rowCount || 0;
+    const totalRows =
+      sheetMensuel.actualRowCount || sheetMensuel.rowCount || 0;
 
     if (totalRows > MAX_ROWS) {
-      await job.echouer(`Fichier trop volumineux (${totalRows} lignes, max ${MAX_ROWS})`);
+      await job.echouer(
+        `Fichier trop volumineux (${totalRows} lignes, max ${MAX_ROWS})`
+      );
       await job.save();
       importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
       return res.status(400).json({
         success: false,
-        message: `Fichier trop volumineux : ${totalRows} lignes (maximum ${MAX_ROWS}). Contactez l'administrateur.`,
+        message: `Fichier trop volumineux : ${totalRows} lignes (maximum ${MAX_ROWS}).`,
       });
     }
 
-    // ============================================================
-    // 4. Paramètres PSB
-    // ============================================================
     const params = {};
     sheetPSB.eachRow({ includeEmpty: false }, (row) => {
       const key = row.getCell(1).text.trim();
@@ -412,9 +434,6 @@ const importReporting = async (req, res) => {
       params[key] = isNaN(numValue) ? value : numValue;
     });
 
-    // ============================================================
-    // 5. Preview (30 premières lignes)
-    // ============================================================
     const previewRows = [];
     for (let i = 1; i <= Math.min(PREVIEW_LIMIT, totalRows); i++) {
       const row = sheetMensuel.getRow(i);
@@ -429,24 +448,23 @@ const importReporting = async (req, res) => {
       previewRows.push(rowData);
     }
 
-    // --- Détection nom SFD ---
     let sfdName = extraireNomSFD(previewRows);
     if (!sfdName) {
-      sfdName = previewRows[2] && previewRows[2][5] ? previewRows[2][5].trim() : 'SFD INCONNU';
+      sfdName =
+        previewRows[2] && previewRows[2][5]
+          ? previewRows[2][5].trim()
+          : 'SFD INCONNU';
     }
 
-    // --- SFD : trouver ou créer (robuste aux race conditions) ---
     const sfd = await getOrCreateSFD(sfdName, req.user._id);
-
-    // --- Assureur par défaut ---
     const defaultAssureur = await getOrCreateDefaultAssureur();
+    const contrat = await getOrCreateContrat(
+      sfd,
+      params,
+      defaultAssureur,
+      req.user._id
+    );
 
-    // --- Contrat : trouver ou créer (robuste aux race conditions) ---
-    const contrat = await getOrCreateContrat(sfd, params, defaultAssureur, req.user._id);
-
-    // ============================================================
-    // 6. Détection ligne d'en-tête
-    // ============================================================
     const headerKeywords = [
       'Identifiant emprunteur',
       'Identifiant',
@@ -484,6 +502,11 @@ const importReporting = async (req, res) => {
       await job.echouer('En-tête du fichier non trouvé');
       await job.save();
       importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
       return res.status(400).json({
         success: false,
         message: 'En-tête du fichier non trouvé',
@@ -492,21 +515,36 @@ const importReporting = async (req, res) => {
 
     const headers = previewRows[headerRowIndex - 1] || [];
 
-    // ============================================================
-    // 7. Mapping des colonnes
-    // ============================================================
     const colIndex = {
       guichet: findColIndex(headers, ['Guichet']),
       localite: findColIndex(headers, ['Localité du Guichet', 'Localité']),
-      identifiant: findColIndex(headers, ['Identifiant emprunteur', 'Identifiant', 'ID', 'id']),
+      identifiant: findColIndex(headers, [
+        'Identifiant emprunteur',
+        'Identifiant',
+        'ID',
+        'id',
+      ]),
       nom: findColIndex(headers, ['Nom emprunteur', 'Nom', 'NOM']),
-      prenom: findColIndex(headers, ['Prénom emprunteur', 'Prénom', 'PRENOM']),
+      prenom: findColIndex(headers, [
+        'Prénom emprunteur',
+        'Prénom',
+        'PRENOM',
+      ]),
       adresse: findColIndex(headers, ['Adresse']),
-      dateNaissance: findColIndex(headers, ['Date de naissance', 'Date naissance']),
+      dateNaissance: findColIndex(headers, [
+        'Date de naissance',
+        'Date naissance',
+      ]),
       profession: findColIndex(headers, ['Profession']),
       sexe: findColIndex(headers, ['Sexe']),
-      dateFinPret: findColIndex(headers, ['date de fin du prêt', 'Date fin prêt']),
-      moisReporting: findColIndex(headers, ['Mois du reporting', 'Mois reporting']),
+      dateFinPret: findColIndex(headers, [
+        'date de fin du prêt',
+        'Date fin prêt',
+      ]),
+      moisReporting: findColIndex(headers, [
+        'Mois du reporting',
+        'Mois reporting',
+      ]),
       datePret: findColIndex(headers, ['Date du prêt', 'Date prêt']),
       dureePret: findColIndex(headers, [
         'durée du prêt (en nombre de mois)',
@@ -516,7 +554,10 @@ const importReporting = async (req, res) => {
       montantPret: findColIndex(headers, ['montant du prêt', 'Montant prêt']),
       typeCredit: findColIndex(headers, ['Type de crédit', 'Type crédit']),
       typePret: findColIndex(headers, ['Type de prêt', 'Type prêt']),
-      tauxInteret: findColIndex(headers, ["Taux d'interet du prêt", "Taux d'interet"]),
+      tauxInteret: findColIndex(headers, [
+        "Taux d'interet du prêt",
+        "Taux d'interet",
+      ]),
       sinistre: findColIndex(headers, ['Sinistre']),
       moisPret: findColIndex(headers, ['mois du prêt', 'Mois prêt']),
     };
@@ -525,73 +566,130 @@ const importReporting = async (req, res) => {
       await job.echouer('Colonne "Nom" non trouvée');
       await job.save();
       importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
       return res.status(400).json({
         success: false,
         message: 'Colonne "Nom" non trouvée dans le fichier',
       });
     }
 
-    // ============================================================
-    // 8. Détection période
-    // ============================================================
-    let mois = 1;
-    let annee = new Date().getFullYear();
-    let dateFromReporting = false;
+    const periodResult = periodDetector.detectPeriod({
+      fileName: req.file.originalname,
+      previewRows,
+      headerRowIndex,
+      colIndex: {
+        moisReporting: colIndex.moisReporting,
+        datePret: colIndex.datePret,
+      },
+      userProvided: null,
+    });
 
-    for (let i = headerRowIndex; i < Math.min(headerRowIndex + 10, previewRows.length); i++) {
-      const row = previewRows[i];
-      if (!row) continue;
+    if (
+      !periodResult.isReliable ||
+      periodResult.mois == null ||
+      periodResult.annee == null
+    ) {
+      await job.echouer('Période de reporting non détectable');
+      await job.save();
 
-      const moisStr = row[colIndex.moisReporting]
-        ? row[colIndex.moisReporting].toString().trim().toUpperCase()
-        : '';
-
-      if (moisStr) {
-        for (let m = 0; m < MOIS_NOMS_UPPER.length; m++) {
-          if (moisStr.includes(MOIS_NOMS_UPPER[m])) {
-            mois = m + 1;
-            const yearMatch = moisStr.match(/\b(20\d{2})\b/);
-            if (yearMatch) annee = parseInt(yearMatch[1]);
-            dateFromReporting = true;
-            break;
-          }
-        }
-        if (dateFromReporting) break;
+      importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
       }
+
+      return res.status(400).json({
+        success: false,
+        message:
+          'Période du reporting non détectable. Vérifiez que le nom du fichier contient le mois et l\'année.',
+        data: {
+          detectedPeriod: {
+            source: periodResult.source,
+            confidence: periodResult.confidence,
+            candidates: periodResult.candidates,
+            warnings: periodResult.warnings,
+          },
+        },
+      });
     }
 
-    if (!dateFromReporting || annee < 2000) {
-      for (let i = headerRowIndex; i < previewRows.length; i++) {
-        const row = previewRows[i];
-        if (!row) continue;
-        const datePret = toDate(row[colIndex.datePret]);
-        if (datePret) {
-          mois = datePret.getMonth() + 1;
-          annee = datePret.getFullYear();
-          break;
-        }
+    const mois = periodResult.mois;
+    const annee = periodResult.annee;
+
+    const analysis = await idempotencyService.analyzeImport({
+      fileHash,
+      institutionId: sfd._id,
+      month: mois,
+      year: annee,
+      forceReplace,
+    });
+
+    if (analysis.action === 'BLOCK') {
+      await job.echouer(`Import bloqué : ${analysis.errorCode}`);
+      await job.save();
+
+      importsInProgress.delete(userId);
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
       }
+
+      const existingJob = analysis.existingJob || analysis.conflictingJob;
+      const errorResponse = idempotencyService.buildErrorResponse(
+        analysis.errorCode,
+        existingJob,
+        analysis.reason
+      );
+
+      return res.status(errorResponse.statusCode).json(errorResponse.body);
     }
 
-    if (!annee || annee < 2000) annee = new Date().getFullYear();
+    const versionNumber = analysis.versionNumber;
 
     const dateDebut = new Date(annee, mois - 1, 1);
     const dateFin = new Date(annee, mois, 0);
 
     previewRows.length = 0;
 
-    // ============================================================
-    // 9. Suppression ancien reporting si existant
-    // ============================================================
-    const existing = await ReportingMensuel.findOne({ sfdId: sfd._id, mois, annee });
-    if (existing) {
-      await Adhesion.deleteMany({ reportingMensuelId: existing._id });
-      await ReportingMensuel.findByIdAndDelete(existing._id);
-    }
+    importJob = await ImportJob.create({
+      fileHash,
+      fileName: req.file.originalname,
+      fileSize: req.file.size,
+      uploadedBy: req.user._id,
+      institutionId: sfd._id,
+      contratId: contrat._id,
+      status: 'RUNNING',
+      lifecycle: 'ACTIVE',
+      startedAt: new Date(),
+      detectedPeriod: {
+        month: mois,
+        year: annee,
+        source: periodResult.source,
+        confidence: periodResult.confidence,
+        isReliable: periodResult.isReliable,
+        isAmbiguous: periodResult.isAmbiguous,
+        candidates: periodResult.candidates.map((c) => ({
+          month: c.mois,
+          year: c.annee,
+          source: c.source,
+          confidence: c.confidence,
+        })),
+        warnings: periodResult.warnings,
+      },
+      counters: importStatsService.createCounters(),
+      notInstrumentedYet: importStatsService.getNotInstrumentedCounters(),
+      ignoredLines: [],
+      versionNumber,
+      forceReplaceRequested: forceReplace,
+      replacementReason: replacementReason || null,
+    });
 
-    // ============================================================
-    // 10. Création du reporting
-    // ============================================================
     const reporting = await ReportingMensuel.create({
       sfdId: sfd._id,
       contratId: contrat._id,
@@ -608,11 +706,40 @@ const importReporting = async (req, res) => {
       },
       statut: STATUT_REPORTING.EN_VALIDATION,
       creePar: req.user._id,
+      importJobId: importJob._id,
+      lifecycle: 'ACTIVE',
+      versionNumber,
     });
 
-    // ============================================================
-    // 11. TRAITEMENT PRINCIPAL — ligne par ligne
-    // ============================================================
+    importJob.reportingMensuelId = reporting._id;
+    await importJob.save();
+
+    if (analysis.action === 'CREATE_WITH_REPLACE') {
+      const oldJob = analysis.existingJob || analysis.conflictingJob;
+
+      if (oldJob && oldJob._id) {
+        await idempotencyService.linkImportJobs(importJob._id, oldJob._id);
+
+        if (oldJob.reportingMensuelId) {
+          await idempotencyService.linkReportings(
+            reporting._id,
+            oldJob.reportingMensuelId
+          );
+
+          await idempotencyService.markAdhesionsAsSuperseded(
+            oldJob.reportingMensuelId
+          );
+        }
+      }
+    }
+
+    importJob.sourceRowsRange = {
+      startRow: headerRowIndex + 1,
+      endRow: totalRows,
+      sheetUsed: sheetMensuel.name,
+    };
+    await importJob.save();
+
     const adhesionIds = [];
     const exclusionIds = [];
     const erreurs = [];
@@ -621,28 +748,74 @@ const importReporting = async (req, res) => {
     let batch = [];
     let lastProgressUpdate = 0;
 
+    const counters = importJob.counters;
+
     job.demarrer();
     await job.save();
 
     const startTime = Date.now();
 
-    for (let rowNumber = headerRowIndex + 1; rowNumber <= totalRows; rowNumber++) {
+    for (
+      let rowNumber = headerRowIndex + 1;
+      rowNumber <= totalRows;
+      rowNumber++
+    ) {
+      importStatsService.incrementCounter(counters, 'sourceRows');
+
       const row = sheetMensuel.getRow(rowNumber);
-      if (!row || !row.hasValues) continue;
+
+      if (!row || !row.hasValues) {
+        importStatsService.incrementCounter(counters, 'ignoredRows');
+        importJob.addIgnoredLine(
+          rowNumber,
+          sheetMensuel.name,
+          'NO_VALUES',
+          null
+        );
+        continue;
+      }
 
       const rowData = [];
       row.eachCell({ includeEmpty: false }, (cell) => {
         rowData.push(cell.text);
       });
 
-      const hasData = rowData.some((c) => c !== undefined && c !== null && c !== '');
+      const hasData = rowData.some(
+        (c) => c !== undefined && c !== null && String(c).trim() !== ''
+      );
+
       if (!hasData) {
+        importStatsService.incrementCounter(counters, 'ignoredRows');
+        const rawSnapshot = {};
+        rowData.forEach((v, i) => {
+          rawSnapshot[`col_${i}`] = v;
+        });
+        importJob.addIgnoredLine(
+          rowNumber,
+          sheetMensuel.name,
+          'EMPTY_ROW',
+          rawSnapshot
+        );
         rowData.length = 0;
         continue;
       }
 
-      const nom = rowData[colIndex.nom] ? rowData[colIndex.nom].toString().trim() : '';
+      const nom = rowData[colIndex.nom]
+        ? rowData[colIndex.nom].toString().trim()
+        : '';
+
       if (!nom) {
+        importStatsService.incrementCounter(counters, 'ignoredRows');
+        const rawSnapshot = {};
+        rowData.forEach((v, i) => {
+          rawSnapshot[`col_${i}`] = v;
+        });
+        importJob.addIgnoredLine(
+          rowNumber,
+          sheetMensuel.name,
+          'MISSING_NAME',
+          rawSnapshot
+        );
         rowData.length = 0;
         continue;
       }
@@ -661,24 +834,25 @@ const importReporting = async (req, res) => {
 
       const age = calculerAge(dateNaissance, datePret);
 
-      const controleDate =
-        datePret && datePret >= dateDebut && datePret <= dateFin ? 'ok' : 'no';
-      const controleAge =
-        age >= contrat.ageMin &&
-        age <= contrat.ageMaxDebut &&
-        age + dureePret / 12 <= contrat.ageMaxFin
-          ? 'ok'
-          : 'no';
-      const controleMontant =
-        montantPret >= contrat.montantMin && montantPret <= contrat.montantMax ? 'ok' : 'no';
-      const controleDuree = dureePret >= contrat.dureeMin ? 'ok' : 'no';
-      const controleGlobal =
-        controleAge === 'ok' &&
-        controleDate === 'ok' &&
-        controleMontant === 'ok' &&
-        controleDuree === 'ok'
-          ? 'ok'
-          : 'no';
+      const ruleResults = ruleEngine.evaluateAll({
+        datePret,
+        dateDebut,
+        dateFin,
+        age,
+        dureePret,
+        montantPret,
+        contrat,
+      });
+
+      const {
+        controleDate,
+        controleAge,
+        controleMontant,
+        controleDuree,
+        controleGlobal,
+        validationResults,
+        exclusionReasons,
+      } = ruleResults;
 
       let tauxPrime = contrat.tauxPrime1;
       if (montantPret > contrat.seuilPrime2) {
@@ -693,6 +867,46 @@ const importReporting = async (req, res) => {
         ? rowData[colIndex.sinistre].toString().trim()
         : '';
       const estSinistre = !!sinistreValue;
+
+      const rawData = {};
+      rowData.forEach((v, i) => {
+        rawData[`col_${i}`] = v;
+      });
+
+      const normalizedData = {
+        nom,
+        prenom,
+        identifiant,
+        montantPret,
+        dureePret,
+        age,
+        datePret: datePret ? datePret.toISOString() : null,
+        dateNaissance: dateNaissance ? dateNaissance.toISOString() : null,
+        dateFinPret: dateFinPret ? dateFinPret.toISOString() : null,
+        sexe: rowData[colIndex.sexe]
+          ? rowData[colIndex.sexe].toString().trim().toUpperCase()
+          : '',
+      };
+
+      const motifExclusion =
+        controleGlobal === 'no'
+          ? [
+              controleAge === 'no'
+                ? `Âge invalide (${age} ans, max ${contrat.ageMaxDebut})`
+                : null,
+              controleDate === 'no'
+                ? `Date de prêt invalide (hors période)`
+                : null,
+              controleMontant === 'no'
+                ? `Montant invalide (${montantPret} FCFA, max ${contrat.montantMax})`
+                : null,
+              controleDuree === 'no'
+                ? `Durée invalide (${dureePret} mois, min ${contrat.dureeMin})`
+                : null,
+            ]
+              .filter(Boolean)
+              .join('; ')
+          : '';
 
       batch.push({
         reportingMensuelId: reporting._id,
@@ -759,47 +973,104 @@ const importReporting = async (req, res) => {
         },
         statut: controleGlobal === 'ok' ? 'ACTIVE' : 'EXCLUE',
         estExclue: controleGlobal === 'no',
-        motifExclusion:
-          controleGlobal === 'no'
-            ? [
-                controleAge === 'no'
-                  ? `Âge invalide (${age} ans, max ${contrat.ageMaxDebut})`
-                  : null,
-                controleDate === 'no' ? `Date de prêt invalide (hors période)` : null,
-                controleMontant === 'no'
-                  ? `Montant invalide (${montantPret} FCFA, max ${contrat.montantMax})`
-                  : null,
-                controleDuree === 'no'
-                  ? `Durée invalide (${dureePret} mois, min ${contrat.dureeMin})`
-                  : null,
-              ]
-                .filter(Boolean)
-                .join('; ')
-            : '',
+        motifExclusion,
         ligneOriginale: rowNumber,
         creePar: req.user._id,
+
+        importJobId: importJob._id,
+        sheetName: sheetMensuel.name,
+        sourceRowNumber: rowNumber,
+        rawData,
+        normalizedData,
+        validationResults,
+        exclusionReasons,
+        status: controleGlobal === 'ok' ? 'VALID' : 'EXCLUDED',
+
+        reportingLifecycle: 'ACTIVE',
       });
 
       rowData.length = 0;
 
       if (batch.length >= BATCH_SIZE) {
         try {
-          const inserted = await Adhesion.insertMany(batch, { ordered: false });
+          const inserted = await Adhesion.insertMany(batch, {
+            ordered: false,
+          });
           inserted.forEach((doc) => {
             if (doc.estExclue) {
               exclusionIds.push(doc._id);
               totalExclusions++;
+              importStatsService.incrementCounter(counters, 'excludedRows');
             } else {
               adhesionIds.push(doc._id);
               totalAdhesions++;
+              importStatsService.incrementCounter(counters, 'validRows');
             }
           });
         } catch (err) {
-          erreurs.push({
-            ligne: rowNumber,
-            message: err.message,
-            donnees: batch.length,
-          });
+          const analysis2 = importStatsService.analyzeInsertManyError(
+            err,
+            batch.length
+          );
+
+          if (analysis2.isExact) {
+            const insertedDocs = Array.isArray(err.insertedDocs)
+              ? err.insertedDocs
+              : [];
+            insertedDocs.forEach((doc) => {
+              if (doc.estExclue) {
+                exclusionIds.push(doc._id);
+                totalExclusions++;
+                importStatsService.incrementCounter(
+                  counters,
+                  'excludedRows'
+                );
+              } else {
+                adhesionIds.push(doc._id);
+                totalAdhesions++;
+                importStatsService.incrementCounter(counters, 'validRows');
+              }
+            });
+
+            importStatsService.incrementCounter(
+              counters,
+              'errorRows',
+              analysis2.errorCount
+            );
+
+            erreurs.push({
+              ligne: rowNumber,
+              message: err.message,
+              donnees: batch.length,
+              insertedCount: analysis2.insertedCount,
+              errorCount: analysis2.errorCount,
+              isExact: true,
+              method: analysis2.details.method,
+            });
+          } else {
+            importStatsService.incrementCounter(
+              counters,
+              'errorRows',
+              batch.length
+            );
+
+            importJob.addAnomaly(
+              'INSERT_MANY_OPAQUE',
+              `Impossible de distinguer les insertions réussies des échecs sur le batch finissant à la ligne ${rowNumber}.`,
+              'WARNING',
+              rowNumber
+            );
+
+            erreurs.push({
+              ligne: rowNumber,
+              message: err.message,
+              donnees: batch.length,
+              insertedCount: 0,
+              errorCount: batch.length,
+              isExact: false,
+              method: 'fallback',
+            });
+          }
         }
 
         batch.length = 0;
@@ -821,24 +1092,81 @@ const importReporting = async (req, res) => {
           if (doc.estExclue) {
             exclusionIds.push(doc._id);
             totalExclusions++;
+            importStatsService.incrementCounter(counters, 'excludedRows');
           } else {
             adhesionIds.push(doc._id);
             totalAdhesions++;
+            importStatsService.incrementCounter(counters, 'validRows');
           }
         });
       } catch (err) {
-        erreurs.push({
-          ligne: 'final',
-          message: err.message,
-          donnees: batch.length,
-        });
+        const analysis2 = importStatsService.analyzeInsertManyError(
+          err,
+          batch.length
+        );
+
+        if (analysis2.isExact) {
+          const insertedDocs = Array.isArray(err.insertedDocs)
+            ? err.insertedDocs
+            : [];
+          insertedDocs.forEach((doc) => {
+            if (doc.estExclue) {
+              exclusionIds.push(doc._id);
+              totalExclusions++;
+              importStatsService.incrementCounter(counters, 'excludedRows');
+            } else {
+              adhesionIds.push(doc._id);
+              totalAdhesions++;
+              importStatsService.incrementCounter(counters, 'validRows');
+            }
+          });
+
+          importStatsService.incrementCounter(
+            counters,
+            'errorRows',
+            analysis2.errorCount
+          );
+
+          erreurs.push({
+            ligne: 'final',
+            message: err.message,
+            donnees: batch.length,
+            insertedCount: analysis2.insertedCount,
+            errorCount: analysis2.errorCount,
+            isExact: true,
+            method: analysis2.details.method,
+          });
+        } else {
+          importStatsService.incrementCounter(
+            counters,
+            'errorRows',
+            batch.length
+          );
+
+          importJob.addAnomaly(
+            'INSERT_MANY_OPAQUE',
+            `Impossible de distinguer les insertions réussies des échecs sur le batch final.`,
+            'WARNING',
+            null
+          );
+
+          erreurs.push({
+            ligne: 'final',
+            message: err.message,
+            donnees: batch.length,
+            insertedCount: 0,
+            errorCount: batch.length,
+            isExact: false,
+            method: 'fallback',
+          });
+        }
       }
       batch.length = 0;
     }
 
-    // ============================================================
-    // 12. Totaux
-    // ============================================================
+    counters.processedRows =
+      counters.validRows + counters.excludedRows + counters.errorRows;
+
     let totalPrime = 0;
     let totalFraisGestion = 0;
     let totalTaxes = 0;
@@ -877,7 +1205,8 @@ const importReporting = async (req, res) => {
     reporting.totalMontantDu = totalMontantDu;
     reporting.commissionSFD = totalPrime * (contrat.tauxCommissionSFD || 0.07);
     reporting.commissionIG = totalPrime * (contrat.tauxCommissionIG || 0.15);
-    reporting.commissionAssureur = totalPrime * (contrat.tauxCommissionAssureur || 0.05);
+    reporting.commissionAssureur =
+      totalPrime * (contrat.tauxCommissionAssureur || 0.05);
 
     if (totalExclusions > 0) {
       reporting.statut = STATUT_REPORTING.EXCLUSIONS_A_CORRIGER;
@@ -886,11 +1215,15 @@ const importReporting = async (req, res) => {
       reporting.exclusions.dateLimiteCorrection = dateLimite;
     }
 
+    const coherence = importStatsService.assertCoherence(counters);
+
+    if (!coherence.coherent) {
+      importJob.addAnomaly('TOTAL_MISMATCH', coherence.message, 'ERROR', null);
+    }
+
+    reporting.sourceTotals = counters;
     await reporting.save();
 
-    // ============================================================
-    // 13. Sinistres
-    // ============================================================
     if (adhesionIds.length > 0) {
       const sinistresAdhesions = await Adhesion.find({
         _id: { $in: adhesionIds },
@@ -921,9 +1254,6 @@ const importReporting = async (req, res) => {
       }
     }
 
-    // ============================================================
-    // 14. Suivi intermédiation
-    // ============================================================
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: sfd._id, mois, annee },
       {
@@ -936,9 +1266,6 @@ const importReporting = async (req, res) => {
       { upsert: true, returnDocument: 'after' }
     );
 
-    // ============================================================
-    // 15. Fin du job
-    // ============================================================
     const dureeMs = Date.now() - startTime;
 
     job.terminer(
@@ -950,13 +1277,16 @@ const importReporting = async (req, res) => {
         erreurs: erreurs.length,
         dureeMs,
       },
-      `Import terminé : ${totalAdhesions} adhésions, ${totalExclusions} exclusions en ${(dureeMs / 1000).toFixed(1)}s`
+      `Import terminé : ${totalAdhesions} adhésions, ${totalExclusions} exclusions en ${(
+        dureeMs / 1000
+      ).toFixed(1)}s`
     );
     await job.save();
 
-    // ============================================================
-    // 16. Nettoyage
-    // ============================================================
+    importJob.counters = counters;
+    importJob.markCompleted();
+    await importJob.save();
+
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
@@ -965,49 +1295,90 @@ const importReporting = async (req, res) => {
       }
     }
 
-    // ✅ Libérer le verrou AVANT de répondre
     importsInProgress.delete(userId);
+
+    await reporting.populate('sfdId', 'nom code');
 
     res.status(201).json({
       success: true,
-      message: 'Reporting importé avec succès',
+      message:
+        analysis.action === 'CREATE_WITH_REPLACE'
+          ? `Reporting remplacé avec succès (version ${versionNumber})`
+          : 'Reporting importé avec succès',
       data: {
         reporting,
         job,
+        importJob: {
+          _id: importJob._id,
+          versionNumber: importJob.versionNumber,
+          lifecycle: importJob.lifecycle,
+          supersedes: importJob.supersedes,
+          supersededBy: importJob.supersededBy,
+        },
+        institution: {
+          _id: sfd._id,
+          nom: sfd.nom,
+          code: sfd.code,
+        },
         totalAdhesions,
         totalExclusions,
         totalPrime,
         erreurs: erreurs.length,
         dureeMs,
+        action: analysis.action,
       },
     });
   } catch (error) {
-    // ✅ Libérer le verrou en cas d'erreur
     importsInProgress.delete(userId);
 
     console.error('❌ Erreur import reporting:', error);
+
+    if (error.code === 11000) {
+      if (job) {
+        try {
+          await job.echouer('Doublon détecté (race condition)');
+          await job.save();
+        } catch (e) {}
+      }
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      }
+      return res.status(409).json({
+        success: false,
+        error: 'DUPLICATE_FILE',
+        message:
+          'Un import identique est déjà en cours ou a été créé simultanément. Veuillez réessayer.',
+      });
+    }
 
     if (job) {
       try {
         await job.echouer(error.message);
         await job.save();
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) {}
+    }
+
+    if (importJob) {
+      try {
+        importJob.addAnomaly('IMPORT_FAILED', error.message, 'ERROR', null);
+        importJob.markFailed(error.message);
+        await importJob.save();
+      } catch (e) {}
     }
 
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
-      } catch (e) {
-        /* ignore */
-      }
+      } catch (e) {}
     }
 
     res.status(500).json({
       success: false,
       message: 'Erreur lors de l\'import du reporting',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+      error:
+        process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }
 };
@@ -1019,7 +1390,9 @@ const importReporting = async (req, res) => {
 const soumettreImportReporting = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ success: false, message: 'Aucun fichier fourni' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Aucun fichier fourni' });
     }
 
     const job = await addImportJob({
@@ -1057,9 +1430,23 @@ const soumettreImportReporting = async (req, res) => {
 
 const getReportings = async (req, res) => {
   try {
-    const { sfdId, mois, annee, statut, limit = 50, page = 1 } = req.query;
+    const {
+      sfdId,
+      mois,
+      annee,
+      statut,
+      limit = 50,
+      page = 1,
+      includeSuperseded = 'false',
+      includeDetails = 'false',
+    } = req.query;
 
     const filter = { estActif: true };
+
+    if (includeSuperseded !== 'true') {
+      filter.lifecycle = 'ACTIVE';
+    }
+
     if (sfdId) filter.sfdId = sfdId;
     if (mois) filter.mois = parseInt(mois);
     if (annee) filter.annee = parseInt(annee);
@@ -1071,11 +1458,16 @@ const getReportings = async (req, res) => {
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const reportings = await ReportingMensuel.find(filter)
+    const projection = getProjection(
+      includeDetails,
+      REPORTING_LIGHT_PROJECTION
+    );
+
+    const reportings = await ReportingMensuel.find(filter, projection)
       .populate('sfdId', 'nom code')
       .populate('contratId', 'nom code')
       .populate('creePar', 'nom email')
-      .sort({ annee: -1, mois: -1 })
+      .sort({ annee: -1, mois: -1, versionNumber: -1 })
       .skip(skip)
       .limit(parseInt(limit));
 
@@ -1113,7 +1505,9 @@ const getReportingById = async (req, res) => {
       .populate('cloturePar', 'nom email');
 
     if (!reporting) {
-      return res.status(404).json({ success: false, message: 'Reporting non trouvé' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'Reporting non trouvé' });
     }
 
     if (
@@ -1121,7 +1515,9 @@ const getReportingById = async (req, res) => {
       req.user.sfdId &&
       reporting.sfdId?._id?.toString() !== req.user.sfdId.toString()
     ) {
-      return res.status(403).json({ success: false, message: 'Accès refusé.' });
+      return res
+        .status(403)
+        .json({ success: false, message: 'Accès refusé.' });
     }
 
     res.status(200).json({ success: true, data: reporting });
@@ -1138,11 +1534,19 @@ const getReportingById = async (req, res) => {
 const getAdhesionsByReporting = async (req, res) => {
   try {
     const { id } = req.params;
-    const { exclude, search, limit = 100, page = 1 } = req.query;
+    const {
+      exclude,
+      search,
+      limit = 100,
+      page = 1,
+      includeDetails = 'false',
+    } = req.query;
 
     const reporting = await ReportingMensuel.findById(id);
     if (!reporting) {
-      return res.status(404).json({ success: false, message: 'Reporting non trouvé' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'Reporting non trouvé' });
     }
 
     const filter = { reportingMensuelId: id };
@@ -1159,7 +1563,12 @@ const getAdhesionsByReporting = async (req, res) => {
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const adhesions = await Adhesion.find(filter)
+    const projection = getProjection(
+      includeDetails,
+      ADHESION_LIGHT_PROJECTION
+    );
+
+    const adhesions = await Adhesion.find(filter, projection)
       .sort({ nomEmprunteur: 1 })
       .skip(skip)
       .limit(parseInt(limit));
@@ -1192,7 +1601,9 @@ const reImporterReporting = async (req, res) => {
 
     const reporting = await ReportingMensuel.findById(id);
     if (!reporting) {
-      return res.status(404).json({ success: false, message: 'Reporting non trouvé' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'Reporting non trouvé' });
     }
 
     if (reporting.statut !== 'EXCLUSIONS_A_CORRIGER') {
@@ -1203,7 +1614,9 @@ const reImporterReporting = async (req, res) => {
     }
 
     if (!req.file) {
-      return res.status(400).json({ success: false, message: 'Aucun fichier fourni' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Aucun fichier fourni' });
     }
 
     reporting.statut = 'CORRIGE';
@@ -1241,11 +1654,15 @@ const cloturerReporting = async (req, res) => {
       .populate('contratId');
 
     if (!reporting) {
-      return res.status(404).json({ success: false, message: 'Reporting non trouvé' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'Reporting non trouvé' });
     }
 
     if (reporting.statut === 'CLOTURE') {
-      return res.status(400).json({ success: false, message: 'Déjà clôturé' });
+      return res
+        .status(400)
+        .json({ success: false, message: 'Déjà clôturé' });
     }
 
     if (reporting.nombreExclusions > 0) {
@@ -1282,7 +1699,11 @@ const cloturerReporting = async (req, res) => {
     }
 
     await SuiviIntermediation.findOneAndUpdate(
-      { sfdId: reporting.sfdId._id, mois: reporting.mois, annee: reporting.annee },
+      {
+        sfdId: reporting.sfdId._id,
+        mois: reporting.mois,
+        annee: reporting.annee,
+      },
       {
         dateClotureReporting: new Date(),
         dateEnvoiDocuments: new Date(),
@@ -1318,7 +1739,9 @@ const telechargerDocument = async (req, res) => {
 
     const reporting = await ReportingMensuel.findById(id);
     if (!reporting) {
-      return res.status(404).json({ success: false, message: 'Reporting non trouvé' });
+      return res
+        .status(404)
+        .json({ success: false, message: 'Reporting non trouvé' });
     }
 
     let doc = null;
@@ -1342,13 +1765,16 @@ const telechargerDocument = async (req, res) => {
         nomFichier = `Cloture_${reporting.mois}_${reporting.annee}.xlsx`;
         break;
       default:
-        return res.status(400).json({ success: false, message: 'Type de document invalide' });
+        return res
+          .status(400)
+          .json({ success: false, message: 'Type de document invalide' });
     }
 
     if (!doc || !doc.chemin || !fs.existsSync(doc.chemin)) {
       return res.status(404).json({
         success: false,
-        message: 'Document non disponible. Clôturez le reporting pour le générer.',
+        message:
+          'Document non disponible. Clôturez le reporting pour le générer.',
       });
     }
 
@@ -1359,6 +1785,331 @@ const telechargerDocument = async (req, res) => {
   }
 };
 
+// ============================================================
+//  🔹 PHASE 5.7 — RÉCUPÉRER UN IMPORTJOB
+// ============================================================
+
+/**
+ * @route   GET /api/reporting/jobs/:id
+ * @desc    Récupérer un ImportJob
+ * @access  Private (GESTIONNAIRE_IG, ADMIN)
+ *
+ * ⚠️ Phase 5.7 : `ignoredLines` est EXCLU par défaut
+ *    pour réduire la taille de la réponse (586 Ko → ~86 Ko).
+ *
+ *    Utiliser `?includeIgnored=true` pour le récupérer.
+ *    Ou la route dédiée `GET /jobs/:id/ignored-lines` (paginée).
+ */
+const getImportJobById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { includeIgnored = 'false' } = req.query;
+
+    // 🔹 Phase 5.7 — Projection : exclure ignoredLines par défaut
+    const projection = getProjection(
+      includeIgnored,
+      IMPORT_JOB_DETAIL_PROJECTION
+    );
+
+    const importJob = await ImportJob.findById(id, projection)
+      .populate('institutionId', 'nom code')
+      .populate('contratId', 'nom code')
+      .populate('uploadedBy', 'nom email')
+      .populate(
+        'reportingMensuelId',
+        'mois annee statut lifecycle versionNumber'
+      )
+      .populate('supersedes', 'fileName versionNumber createdAt')
+      .populate('supersededBy', 'fileName versionNumber createdAt');
+
+    if (!importJob) {
+      return res.status(404).json({
+        success: false,
+        message: 'ImportJob non trouvé',
+      });
+    }
+
+    // 🔹 Phase 5.7 — Métadonnées sur ignoredLines
+    // (sans les charger si non demandé)
+    const response = importJob.toObject();
+
+    if (!response.ignoredLines) {
+      // Charger uniquement le count et les stats par raison
+      const stats = await ImportJob.aggregate([
+        { $match: { _id: importJob._id } },
+        {
+          $project: {
+            total: { $size: '$ignoredLines' },
+            byReason: {
+              $arrayToObject: {
+                $map: {
+                  input: { $setUnion: ['$ignoredLines.reason', []] },
+                  as: 'reason',
+                  in: {
+                    k: '$$reason',
+                    v: {
+                      $size: {
+                        $filter: {
+                          input: '$ignoredLines',
+                          as: 'line',
+                          cond: { $eq: ['$$line.reason', '$$reason'] },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ]);
+
+      const ignoredStats = stats[0] || { total: 0, byReason: {} };
+
+      response.ignoredLinesMeta = {
+        total: ignoredStats.total || 0,
+        byReason: ignoredStats.byReason || {},
+        endpoint: `/api/reporting/jobs/${importJob._id}/ignored-lines`,
+      };
+    } else {
+      response.ignoredLinesMeta = {
+        total: response.ignoredLines.length,
+        byReason: response.ignoredLines.reduce((acc, line) => {
+          acc[line.reason] = (acc[line.reason] || 0) + 1;
+          return acc;
+        }, {}),
+      };
+    }
+
+    res.status(200).json({
+      success: true,
+      data: response,
+    });
+  } catch (error) {
+    console.error('❌ Erreur getImportJobById:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors du chargement de l\'ImportJob',
+    });
+  }
+};
+
+// ============================================================
+//  🔹 PHASE 5.7 — LIGNES IGNORÉES PAGINÉES
+// ============================================================
+
+/**
+ * @route   GET /api/reporting/jobs/:id/ignored-lines
+ * @desc    Récupérer les lignes ignorées d'un ImportJob (paginé)
+ * @access  Private (GESTIONNAIRE_IG, ADMIN)
+ *
+ * Query params :
+ *   - page  : numéro de page (défaut 1)
+ *   - limit : nombre par page (défaut 50, max 500)
+ *   - reason: filtrer par raison (NO_VALUES, EMPTY_ROW, MISSING_NAME)
+ */
+const getIgnoredLines = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      page = 1,
+      limit = 50,
+      reason,
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(500, Math.max(1, parseInt(limit)));
+    const skip = (pageNum - 1) * limitNum;
+
+    // Vérifier que l'ImportJob existe
+    const job = await ImportJob.findById(id).select('_id ignoredLines').lean();
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'ImportJob non trouvé',
+      });
+    }
+
+    // Filtre sur la raison (optionnel)
+    const matchFilter = { _id: job._id };
+    const unwindFilter = reason ? { $eq: ['$ignoredLines.reason', reason] } : {};
+
+    // Agrégation paginée
+    const pipeline = [
+      { $match: matchFilter },
+      { $unwind: '$ignoredLines' },
+    ];
+
+    if (reason) {
+      pipeline.push({
+        $match: { 'ignoredLines.reason': reason },
+      });
+    }
+
+    // Compter le total
+    const countPipeline = [...pipeline, { $count: 'total' }];
+    const countResult = await ImportJob.aggregate(countPipeline);
+    const total = countResult.length > 0 ? countResult[0].total : 0;
+
+    // Paginer
+    pipeline.push({ $skip: skip });
+    pipeline.push({ $limit: limitNum });
+    pipeline.push({
+      $project: {
+        _id: 0,
+        sourceRowNumber: '$ignoredLines.sourceRowNumber',
+        sheetName: '$ignoredLines.sheetName',
+        reason: '$ignoredLines.reason',
+        rawData: '$ignoredLines.rawData',
+      },
+    });
+
+    const ignoredLines = await ImportJob.aggregate(pipeline);
+
+    // Stats par raison (toujours, pour le filtre frontend)
+    const statsResult = await ImportJob.aggregate([
+      { $match: matchFilter },
+      { $unwind: '$ignoredLines' },
+      {
+        $group: {
+          _id: '$ignoredLines.reason',
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const byReason = statsResult.reduce((acc, item) => {
+      acc[item._id] = item.count;
+      return acc;
+    }, {});
+
+    res.status(200).json({
+      success: true,
+      data: ignoredLines,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        pages: Math.ceil(total / limitNum),
+      },
+      stats: {
+        byReason,
+        totalIgnored: job.ignoredLines?.length || 0,
+      },
+      filters: {
+        reason: reason || null,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur getIgnoredLines:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors du chargement des lignes ignorées',
+    });
+  }
+};
+
+// ============================================================
+//  HISTORIQUE D'UNE PÉRIODE
+// ============================================================
+
+const getImportHistory = async (req, res) => {
+  try {
+    const { institutionId, month, year } = req.query;
+
+    if (!institutionId || !month || !year) {
+      return res.status(400).json({
+        success: false,
+        message: 'institutionId, month et year sont obligatoires',
+      });
+    }
+
+    const jobs = await ImportJob.find({
+      institutionId,
+      'detectedPeriod.month': parseInt(month),
+      'detectedPeriod.year': parseInt(year),
+    })
+      .populate('uploadedBy', 'nom email')
+      .sort({ versionNumber: -1 })
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      data: jobs,
+      total: jobs.length,
+    });
+  } catch (error) {
+    console.error('❌ Erreur getImportHistory:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors du chargement de l\'historique',
+    });
+  }
+};
+
+// ============================================================
+//  LISTE DES IMPORTJOBS
+// ============================================================
+
+const getImportJobs = async (req, res) => {
+  try {
+    const {
+      institutionId,
+      month,
+      year,
+      lifecycle,
+      limit = 50,
+      page = 1,
+      includeDetails = 'false',
+    } = req.query;
+
+    const filter = {};
+    if (institutionId) filter.institutionId = institutionId;
+    if (month) filter['detectedPeriod.month'] = parseInt(month);
+    if (year) filter['detectedPeriod.year'] = parseInt(year);
+    if (lifecycle) filter.lifecycle = lifecycle;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const projection = getProjection(
+      includeDetails,
+      IMPORT_JOB_LIGHT_PROJECTION
+    );
+
+    const jobs = await ImportJob.find(filter)
+      .select(projection || '')
+      .populate('institutionId', 'nom code')
+      .populate('uploadedBy', 'nom email')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    const total = await ImportJob.countDocuments(filter);
+
+    res.status(200).json({
+      success: true,
+      data: jobs,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur getImportJobs:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erreur lors du chargement des jobs',
+    });
+  }
+};
+
+// ============================================================
+//  EXPORTS
+// ============================================================
+
 module.exports = {
   importReporting,
   soumettreImportReporting,
@@ -1368,4 +2119,8 @@ module.exports = {
   reImporterReporting,
   cloturerReporting,
   telechargerDocument,
+  getImportJobById,
+  getIgnoredLines,        // 🔹 Phase 5.7
+  getImportHistory,
+  getImportJobs,
 };

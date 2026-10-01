@@ -1,7 +1,22 @@
+// backend/src/models/ReportingMensuel.js
 const mongoose = require('mongoose');
 
 /**
  * 📊 Reporting Mensuel - Suivi des reportings des SFD
+ *
+ * ⚠️ Phase 5.1 — Ajouts :
+ *    - importJobId  (référence vers l'ImportJob)
+ *    - sourceTotals (miroir des compteurs d'import)
+ *
+ * ⚠️ Phase 5.3 — Ajouts :
+ *    - lifecycle (ACTIVE / SUPERSEDED)
+ *    - versionNumber
+ *    - supersedes / supersededBy (chaînage de réimport)
+ *
+ * ⚠️ Phase 5.3 — Index unique MODIFIÉ :
+ *    AVANT : { sfdId, mois, annee } unique
+ *    APRÈS : { sfdId, mois, annee, versionNumber } unique
+ *    → permet plusieurs versions pour un même mois
  */
 const ReportingMensuelSchema = new mongoose.Schema(
   {
@@ -36,7 +51,7 @@ const ReportingMensuelSchema = new mongoose.Schema(
       type: Number,
       min: 1,
       max: 4,
-      default: function() {
+      default: function () {
         return Math.ceil(this.mois / 3);
       },
     },
@@ -52,55 +67,19 @@ const ReportingMensuelSchema = new mongoose.Schema(
     // ============================================================
     // 3. STATISTIQUES
     // ============================================================
-    nombreAdhesions: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    nombreExclusions: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    totalPrime: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    totalFraisGestion: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    totalTaxes: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    totalMontantDu: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
+    nombreAdhesions: { type: Number, default: 0, min: 0 },
+    nombreExclusions: { type: Number, default: 0, min: 0 },
+    totalPrime: { type: Number, default: 0, min: 0 },
+    totalFraisGestion: { type: Number, default: 0, min: 0 },
+    totalTaxes: { type: Number, default: 0, min: 0 },
+    totalMontantDu: { type: Number, default: 0, min: 0 },
 
     // ============================================================
     // 4. COMMISSIONS
     // ============================================================
-    commissionSFD: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    commissionIG: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    commissionAssureur: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
+    commissionSFD: { type: Number, default: 0, min: 0 },
+    commissionIG: { type: Number, default: 0, min: 0 },
+    commissionAssureur: { type: Number, default: 0, min: 0 },
 
     // ============================================================
     // 5. FICHIERS
@@ -114,14 +93,8 @@ const ReportingMensuelSchema = new mongoose.Schema(
         type: String,
         required: [true, 'Le chemin du fichier est obligatoire'],
       },
-      taille: {
-        type: Number,
-        default: 0,
-      },
-      dateUpload: {
-        type: Date,
-        default: Date.now,
-      },
+      taille: { type: Number, default: 0 },
+      dateUpload: { type: Date, default: Date.now },
     },
     fichierCloture: {
       nom: String,
@@ -170,12 +143,7 @@ const ReportingMensuelSchema = new mongoose.Schema(
     // 8. EXCLUSIONS
     // ============================================================
     exclusions: {
-      ids: [
-        {
-          type: mongoose.Schema.Types.ObjectId,
-          ref: 'Adhesion',
-        },
-      ],
+      ids: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Adhesion' }],
       fichierCorrection: {
         nom: String,
         chemin: String,
@@ -201,28 +169,14 @@ const ReportingMensuelSchema = new mongoose.Schema(
     // ============================================================
     // 10. RÉFÉRENCES AUX ADHÉSIONS
     // ============================================================
-    adhesions: [
-      {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'Adhesion',
-      },
-    ],
+    adhesions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Adhesion' }],
 
     // ============================================================
     // 11. DATES CLÉS
     // ============================================================
-    dateReception: {
-      type: Date,
-      default: Date.now,
-    },
-    dateCloture: {
-      type: Date,
-      default: null,
-    },
-    dateDerniereModification: {
-      type: Date,
-      default: Date.now,
-    },
+    dateReception: { type: Date, default: Date.now },
+    dateCloture: { type: Date, default: null },
+    dateDerniereModification: { type: Date, default: Date.now },
 
     // ============================================================
     // 12. UTILISATEURS
@@ -232,25 +186,62 @@ const ReportingMensuelSchema = new mongoose.Schema(
       ref: 'User',
       required: [true, 'L\'utilisateur créateur est obligatoire'],
     },
-    modifiePar: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-    },
-    cloturePar: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-    },
+    modifiePar: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    cloturePar: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 
     // ============================================================
     // 13. MÉTADONNÉES
     // ============================================================
-    estActif: {
-      type: Boolean,
-      default: true,
+    estActif: { type: Boolean, default: true },
+    notes: { type: String, trim: true },
+
+    // ============================================================
+    // 14. PHASE 5.1 — TRAÇABILITÉ D'IMPORT
+    // ============================================================
+    importJobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ImportJob',
+      default: null,
+      index: true,
     },
-    notes: {
+
+    sourceTotals: {
+      sourceRows: { type: Number, default: 0, min: 0 },
+      processedRows: { type: Number, default: 0, min: 0 },
+      validRows: { type: Number, default: 0, min: 0 },
+      excludedRows: { type: Number, default: 0, min: 0 },
+      ignoredRows: { type: Number, default: 0, min: 0 },
+      invalidRows: { type: Number, default: 0, min: 0 },
+      errorRows: { type: Number, default: 0, min: 0 },
+      duplicateRows: { type: Number, default: 0, min: 0 },
+    },
+
+    // ============================================================
+    // 15. 🔹 PHASE 5.3 — CYCLE DE VIE ET VERSIONING
+    // ============================================================
+
+    lifecycle: {
       type: String,
-      trim: true,
+      enum: ['ACTIVE', 'SUPERSEDED'],
+      default: 'ACTIVE',
+      index: true,
+    },
+
+    versionNumber: {
+      type: Number,
+      default: 1,
+      min: 1,
+    },
+
+    supersedes: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ReportingMensuel',
+      default: null,
+    },
+    supersededBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ReportingMensuel',
+      default: null,
     },
   },
   {
@@ -259,54 +250,77 @@ const ReportingMensuelSchema = new mongoose.Schema(
 );
 
 // ============================================================
-// INDEX (uniques, sans doublons)
+// INDEX
 // ============================================================
 
-// Index unique par SFD et période
-ReportingMensuelSchema.index({ sfdId: 1, mois: 1, annee: 1 }, { unique: true });
+// ⚠️ Phase 5.3 : index modifié
+// AVANT : { sfdId: 1, mois: 1, annee: 1 } unique
+// APRÈS : { sfdId: 1, mois: 1, annee: 1, versionNumber: 1 } unique
+ReportingMensuelSchema.index(
+  { sfdId: 1, mois: 1, annee: 1, versionNumber: 1 },
+  { unique: true, name: 'unique_reporting_by_period_version' }
+);
 
-// Index pour les recherches fréquentes
 ReportingMensuelSchema.index({ statut: 1 });
 ReportingMensuelSchema.index({ dateReception: -1 });
+
+// 🔹 Phase 5.3 — Index lifecycle
+ReportingMensuelSchema.index({ lifecycle: 1, createdAt: -1 });
+ReportingMensuelSchema.index({ supersedes: 1 }, { sparse: true });
+ReportingMensuelSchema.index({ supersededBy: 1 }, { sparse: true });
 
 // ============================================================
 // VIRTUAL
 // ============================================================
-
-ReportingMensuelSchema.virtual('nomComplet').get(function() {
+ReportingMensuelSchema.virtual('nomComplet').get(function () {
   const moisNoms = [
     'Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin',
-    'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'
+    'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre',
   ];
   return `${moisNoms[this.mois - 1]} ${this.annee}`;
 });
 
-ReportingMensuelSchema.virtual('tauxValidation').get(function() {
+ReportingMensuelSchema.virtual('tauxValidation').get(function () {
   const total = this.nombreAdhesions + this.nombreExclusions;
   if (total === 0) return 0;
   return (this.nombreAdhesions / total) * 100;
+});
+
+ReportingMensuelSchema.virtual('isActive').get(function () {
+  return this.lifecycle === 'ACTIVE';
+});
+
+ReportingMensuelSchema.virtual('isSuperseded').get(function () {
+  return this.lifecycle === 'SUPERSEDED';
 });
 
 // ============================================================
 // MÉTHODES
 // ============================================================
-
-ReportingMensuelSchema.methods.estCloture = function() {
+ReportingMensuelSchema.methods.estCloture = function () {
   return this.statut === 'CLOTURE';
 };
 
-ReportingMensuelSchema.methods.estEnAttenteCorrection = function() {
+ReportingMensuelSchema.methods.estEnAttenteCorrection = function () {
   return this.statut === 'EXCLUSIONS_A_CORRIGER';
 };
 
-ReportingMensuelSchema.methods.estValide = function() {
+ReportingMensuelSchema.methods.estValide = function () {
   return this.statut === 'EN_VALIDATION' || this.statut === 'CORRIGE';
 };
 
-ReportingMensuelSchema.methods.calculerTauxValidation = function() {
+ReportingMensuelSchema.methods.calculerTauxValidation = function () {
   const total = this.nombreAdhesions + this.nombreExclusions;
   if (total === 0) return 0;
   return (this.nombreAdhesions / total) * 100;
 };
 
-module.exports = mongoose.model('ReportingMensuel', ReportingMensuelSchema);
+ReportingMensuelSchema.methods.markSuperseded = function (supersededById) {
+  this.lifecycle = 'SUPERSEDED';
+  this.supersededBy = supersededById;
+  return this;
+};
+
+module.exports =
+  mongoose.models.ReportingMensuel ||
+  mongoose.model('ReportingMensuel', ReportingMensuelSchema);
