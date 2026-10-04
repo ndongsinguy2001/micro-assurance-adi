@@ -16,12 +16,13 @@ const importStatsService = require('../services/importStatsService');
 const periodDetector = require('../services/periodDetector');
 const idempotencyService = require('../services/idempotencyService');
 const ruleEngine = require('../services/ruleEngine');
+const sheetDetector = require('../services/sheetDetector'); // 🔹 Phase 5.8
 const { addImportJob } = require('../services/queueService');
 const { genererDocumentsCloture } = require('../services/documentsMensuelsService');
 const {
   ADHESION_LIGHT_PROJECTION,
   IMPORT_JOB_LIGHT_PROJECTION,
-  IMPORT_JOB_DETAIL_PROJECTION,  // 🔹 Phase 5.7
+  IMPORT_JOB_DETAIL_PROJECTION,
   REPORTING_LIGHT_PROJECTION,
   getProjection,
 } = require('../constants/projections');
@@ -365,19 +366,26 @@ const importReporting = async (req, res) => {
       utilisateurId: req.user._id,
     });
 
+    // ============================================================
+    // 2. Lecture Excel
+    // ============================================================
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath, {
       ignoreNodes: ['dataValidations', 'extLst'],
     });
 
-    const sheetMensuel =
-      workbook.getWorksheet('Mensuel OK') ||
-      workbook.getWorksheet('Mensuel ok') ||
-      workbook.getWorksheet('Mensuel');
-    const sheetPSB = workbook.getWorksheet('PSB');
+    // 🔹 PHASE 5.8 — Détection INTELLIGENTE des feuilles (par contenu)
+    const reportingSheetResult = sheetDetector.detectReportingSheet(workbook);
+    const psbSheetResult = sheetDetector.detectPSBSheet(workbook);
 
+    const sheetMensuel = reportingSheetResult.sheet;
+    const sheetPSB = psbSheetResult.sheet;
+
+    // Feuille de reporting : BLOQUANT si absente
     if (!sheetMensuel) {
-      await job.echouer('Onglet "Mensuel OK" introuvable');
+      await job.echouer(
+        'Aucune feuille contenant les données de reporting trouvée'
+      );
       await job.save();
       importsInProgress.delete(userId);
       if (filePath && fs.existsSync(filePath)) {
@@ -387,25 +395,30 @@ const importReporting = async (req, res) => {
       }
       return res.status(400).json({
         success: false,
-        message: 'L\'onglet "Mensuel OK" ou "Mensuel ok" est obligatoire',
+        error: 'NO_REPORTING_SHEET_FOUND',
+        message:
+          'Aucune feuille ne contient les colonnes attendues (Nom emprunteur, Identifiant emprunteur, etc.). Vérifiez la structure du fichier.',
+        data: {
+          exploredSheets: reportingSheetResult.exploredSheets,
+          warnings: reportingSheetResult.warnings,
+        },
       });
     }
+
+    // Feuille PSB : WARNING mais NON bloquant
+    const psbWarnings = psbSheetResult.warnings || [];
+    let psbFallbackUsed = false;
 
     if (!sheetPSB) {
-      await job.echouer('Onglet "PSB" introuvable');
-      await job.save();
-      importsInProgress.delete(userId);
-      if (filePath && fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (e) {}
-      }
-      return res.status(400).json({
-        success: false,
-        message: 'L\'onglet "PSB" est obligatoire',
-      });
+      console.warn(
+        '⚠️ Feuille PSB introuvable — utilisation des paramètres par défaut du contrat'
+      );
+      psbFallbackUsed = true;
     }
 
+    // ============================================================
+    // 3. Garde-fou taille
+    // ============================================================
     const totalRows =
       sheetMensuel.actualRowCount || sheetMensuel.rowCount || 0;
 
@@ -426,14 +439,22 @@ const importReporting = async (req, res) => {
       });
     }
 
+    // ============================================================
+    // 4. Paramètres PSB (avec fallback)
+    // ============================================================
     const params = {};
-    sheetPSB.eachRow({ includeEmpty: false }, (row) => {
-      const key = row.getCell(1).text.trim();
-      const value = row.getCell(2).text;
-      const numValue = parseFloat(value);
-      params[key] = isNaN(numValue) ? value : numValue;
-    });
+    if (sheetPSB) {
+      sheetPSB.eachRow({ includeEmpty: false }, (row) => {
+        const key = row.getCell(1).text.trim();
+        const value = row.getCell(2).text;
+        const numValue = parseFloat(value);
+        params[key] = isNaN(numValue) ? value : numValue;
+      });
+    }
 
+    // ============================================================
+    // 5. Preview
+    // ============================================================
     const previewRows = [];
     for (let i = 1; i <= Math.min(PREVIEW_LIMIT, totalRows); i++) {
       const row = sheetMensuel.getRow(i);
@@ -465,38 +486,10 @@ const importReporting = async (req, res) => {
       req.user._id
     );
 
-    const headerKeywords = [
-      'Identifiant emprunteur',
-      'Identifiant',
-      'ID',
-      'Nom emprunteur',
-      'Nom',
-      'NOM',
-    ];
-
-    let headerRowIndex = -1;
-
-    for (let i = 0; i < previewRows.length; i++) {
-      const row = previewRows[i];
-      if (!row || row.length === 0) continue;
-
-      let matchCount = 0;
-      for (const cell of row) {
-        if (cell && typeof cell === 'string') {
-          for (const kw of headerKeywords) {
-            if (cell.includes(kw)) {
-              matchCount++;
-              break;
-            }
-          }
-        }
-      }
-
-      if (matchCount >= 2) {
-        headerRowIndex = i + 1;
-        break;
-      }
-    }
+    // ============================================================
+    // 6. Ligne d'en-tête — déjà détectée par sheetDetector
+    // ============================================================
+    const headerRowIndex = reportingSheetResult.headerRowIndex;
 
     if (headerRowIndex === -1) {
       await job.echouer('En-tête du fichier non trouvé');
@@ -515,6 +508,9 @@ const importReporting = async (req, res) => {
 
     const headers = previewRows[headerRowIndex - 1] || [];
 
+    // ============================================================
+    // 7. Mapping des colonnes
+    // ============================================================
     const colIndex = {
       guichet: findColIndex(headers, ['Guichet']),
       localite: findColIndex(headers, ['Localité du Guichet', 'Localité']),
@@ -577,6 +573,9 @@ const importReporting = async (req, res) => {
       });
     }
 
+    // ============================================================
+    // 8. Détection période
+    // ============================================================
     const periodResult = periodDetector.detectPeriod({
       fileName: req.file.originalname,
       previewRows,
@@ -657,6 +656,9 @@ const importReporting = async (req, res) => {
 
     previewRows.length = 0;
 
+    // ============================================================
+    // Création du ImportJob
+    // ============================================================
     importJob = await ImportJob.create({
       fileHash,
       fileName: req.file.originalname,
@@ -688,8 +690,13 @@ const importReporting = async (req, res) => {
       versionNumber,
       forceReplaceRequested: forceReplace,
       replacementReason: replacementReason || null,
+      // 🔹 Phase 5.8 — Traçabilité des feuilles
+      sheetNames: workbook.worksheets.map((ws) => ws.name),
     });
 
+    // ============================================================
+    // 9. Création du ReportingMensuel
+    // ============================================================
     const reporting = await ReportingMensuel.create({
       sfdId: sfd._id,
       contratId: contrat._id,
@@ -714,6 +721,27 @@ const importReporting = async (req, res) => {
     importJob.reportingMensuelId = reporting._id;
     await importJob.save();
 
+    // ============================================================
+    // 🔹 Phase 5.8 — Traçabilité de la détection
+    // ============================================================
+    if (psbFallbackUsed) {
+      importJob.addAnomaly(
+        'PSB_SHEET_NOT_FOUND',
+        `Feuille PSB introuvable. Paramètres par défaut utilisés. Feuilles explorées : ${workbook.worksheets.map((ws) => ws.name).join(', ')}`,
+        'WARNING',
+        null
+      );
+    }
+
+    if (reportingSheetResult.warnings && reportingSheetResult.warnings.length > 0) {
+      for (const w of reportingSheetResult.warnings) {
+        importJob.addAnomaly(w.code, w.message, w.severity, null);
+      }
+    }
+
+    // ============================================================
+    // Chaînage si remplacement
+    // ============================================================
     if (analysis.action === 'CREATE_WITH_REPLACE') {
       const oldJob = analysis.existingJob || analysis.conflictingJob;
 
@@ -740,6 +768,9 @@ const importReporting = async (req, res) => {
     };
     await importJob.save();
 
+    // ============================================================
+    // 11. TRAITEMENT PRINCIPAL
+    // ============================================================
     const adhesionIds = [];
     const exclusionIds = [];
     const erreurs = [];
@@ -1167,6 +1198,9 @@ const importReporting = async (req, res) => {
     counters.processedRows =
       counters.validRows + counters.excludedRows + counters.errorRows;
 
+    // ============================================================
+    // 12. Totaux
+    // ============================================================
     let totalPrime = 0;
     let totalFraisGestion = 0;
     let totalTaxes = 0;
@@ -1224,6 +1258,9 @@ const importReporting = async (req, res) => {
     reporting.sourceTotals = counters;
     await reporting.save();
 
+    // ============================================================
+    // 13. Sinistres
+    // ============================================================
     if (adhesionIds.length > 0) {
       const sinistresAdhesions = await Adhesion.find({
         _id: { $in: adhesionIds },
@@ -1254,6 +1291,9 @@ const importReporting = async (req, res) => {
       }
     }
 
+    // ============================================================
+    // 14. Suivi intermédiation
+    // ============================================================
     await SuiviIntermediation.findOneAndUpdate(
       { sfdId: sfd._id, mois, annee },
       {
@@ -1266,6 +1306,9 @@ const importReporting = async (req, res) => {
       { upsert: true, returnDocument: 'after' }
     );
 
+    // ============================================================
+    // 15. Fin du job legacy + ImportJob
+    // ============================================================
     const dureeMs = Date.now() - startTime;
 
     job.terminer(
@@ -1287,6 +1330,9 @@ const importReporting = async (req, res) => {
     importJob.markCompleted();
     await importJob.save();
 
+    // ============================================================
+    // 16. Nettoyage
+    // ============================================================
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
@@ -1297,6 +1343,9 @@ const importReporting = async (req, res) => {
 
     importsInProgress.delete(userId);
 
+    // ============================================================
+    // 17. Populer sfdId pour le frontend
+    // ============================================================
     await reporting.populate('sfdId', 'nom code');
 
     res.status(201).json({
@@ -1319,6 +1368,19 @@ const importReporting = async (req, res) => {
           _id: sfd._id,
           nom: sfd.nom,
           code: sfd.code,
+        },
+        // 🔹 PHASE 5.8 — Informations de détection
+        sheetDetection: {
+          reportingSheetName: sheetMensuel.name,
+          reportingSheetHeaderRow: headerRowIndex,
+          reportingSheetKeywordsMatched: reportingSheetResult.matchedKeywords,
+          psbSheetName: sheetPSB ? sheetPSB.name : null,
+          psbFallbackUsed,
+          exploredSheets: reportingSheetResult.exploredSheets,
+          warnings: [
+            ...reportingSheetResult.warnings,
+            ...(psbWarnings || []),
+          ],
         },
         totalAdhesions,
         totalExclusions,
@@ -1786,26 +1848,14 @@ const telechargerDocument = async (req, res) => {
 };
 
 // ============================================================
-//  🔹 PHASE 5.7 — RÉCUPÉRER UN IMPORTJOB
+//  RÉCUPÉRER UN IMPORTJOB
 // ============================================================
 
-/**
- * @route   GET /api/reporting/jobs/:id
- * @desc    Récupérer un ImportJob
- * @access  Private (GESTIONNAIRE_IG, ADMIN)
- *
- * ⚠️ Phase 5.7 : `ignoredLines` est EXCLU par défaut
- *    pour réduire la taille de la réponse (586 Ko → ~86 Ko).
- *
- *    Utiliser `?includeIgnored=true` pour le récupérer.
- *    Ou la route dédiée `GET /jobs/:id/ignored-lines` (paginée).
- */
 const getImportJobById = async (req, res) => {
   try {
     const { id } = req.params;
     const { includeIgnored = 'false' } = req.query;
 
-    // 🔹 Phase 5.7 — Projection : exclure ignoredLines par défaut
     const projection = getProjection(
       includeIgnored,
       IMPORT_JOB_DETAIL_PROJECTION
@@ -1829,12 +1879,9 @@ const getImportJobById = async (req, res) => {
       });
     }
 
-    // 🔹 Phase 5.7 — Métadonnées sur ignoredLines
-    // (sans les charger si non demandé)
     const response = importJob.toObject();
 
     if (!response.ignoredLines) {
-      // Charger uniquement le count et les stats par raison
       const stats = await ImportJob.aggregate([
         { $match: { _id: importJob._id } },
         {
@@ -1895,33 +1942,18 @@ const getImportJobById = async (req, res) => {
 };
 
 // ============================================================
-//  🔹 PHASE 5.7 — LIGNES IGNORÉES PAGINÉES
+//  LIGNES IGNORÉES PAGINÉES
 // ============================================================
 
-/**
- * @route   GET /api/reporting/jobs/:id/ignored-lines
- * @desc    Récupérer les lignes ignorées d'un ImportJob (paginé)
- * @access  Private (GESTIONNAIRE_IG, ADMIN)
- *
- * Query params :
- *   - page  : numéro de page (défaut 1)
- *   - limit : nombre par page (défaut 50, max 500)
- *   - reason: filtrer par raison (NO_VALUES, EMPTY_ROW, MISSING_NAME)
- */
 const getIgnoredLines = async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      page = 1,
-      limit = 50,
-      reason,
-    } = req.query;
+    const { page = 1, limit = 50, reason } = req.query;
 
     const pageNum = Math.max(1, parseInt(page));
     const limitNum = Math.min(500, Math.max(1, parseInt(limit)));
     const skip = (pageNum - 1) * limitNum;
 
-    // Vérifier que l'ImportJob existe
     const job = await ImportJob.findById(id).select('_id ignoredLines').lean();
     if (!job) {
       return res.status(404).json({
@@ -1930,11 +1962,8 @@ const getIgnoredLines = async (req, res) => {
       });
     }
 
-    // Filtre sur la raison (optionnel)
     const matchFilter = { _id: job._id };
-    const unwindFilter = reason ? { $eq: ['$ignoredLines.reason', reason] } : {};
 
-    // Agrégation paginée
     const pipeline = [
       { $match: matchFilter },
       { $unwind: '$ignoredLines' },
@@ -1946,12 +1975,10 @@ const getIgnoredLines = async (req, res) => {
       });
     }
 
-    // Compter le total
     const countPipeline = [...pipeline, { $count: 'total' }];
     const countResult = await ImportJob.aggregate(countPipeline);
     const total = countResult.length > 0 ? countResult[0].total : 0;
 
-    // Paginer
     pipeline.push({ $skip: skip });
     pipeline.push({ $limit: limitNum });
     pipeline.push({
@@ -1966,7 +1993,6 @@ const getIgnoredLines = async (req, res) => {
 
     const ignoredLines = await ImportJob.aggregate(pipeline);
 
-    // Stats par raison (toujours, pour le filtre frontend)
     const statsResult = await ImportJob.aggregate([
       { $match: matchFilter },
       { $unwind: '$ignoredLines' },
@@ -2120,7 +2146,7 @@ module.exports = {
   cloturerReporting,
   telechargerDocument,
   getImportJobById,
-  getIgnoredLines,        // 🔹 Phase 5.7
+  getIgnoredLines,
   getImportHistory,
   getImportJobs,
 };
